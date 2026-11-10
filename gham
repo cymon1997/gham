@@ -1,0 +1,665 @@
+#!/usr/bin/env bash
+# gham — GitHub Account Manager.
+#
+# Keeps several GitHub identities on one machine and picks one per directory,
+# per shell, per command, or as the machine default — the sibling of cam.
+#
+# How it works
+#   An account is a directory under $GHAM_HOME/accounts/<name> holding:
+#     gh/            GH_CONFIG_DIR for this account: its own hosts.yml (the gh
+#                    login); config.yml is a symlink to the shared gh config,
+#                    so aliases and settings are shared.
+#     ssh/           the account's SSH key, when gham generated one.
+#     account.conf   login, host, git name/email and SSH key path.
+#
+#   $GHAM_HOME/bin/gh and $GHAM_HOME/bin/git are shims. With $GHAM_HOME/bin
+#   first on PATH they resolve an account and exec the real binary with:
+#     GH_CONFIG_DIR          the account's gh login
+#     GIT_CONFIG_COUNT/...   user.name, user.email, core.sshCommand (the
+#                            account's key) and a credential helper that asks
+#                            the account's gh for HTTPS tokens
+#   ~/.gitconfig itself is never edited, and `git config --global` still
+#   writes there.
+#
+#   Resolution order: GHAM_ACCOUNT_ACTIVE (set by `gham run` and passed on to
+#   child processes) > GHAM_ACCOUNT (`gham use`) > the longest `gham bind`
+#   directory containing the working directory > the default.
+set -euo pipefail
+
+GHAM_VERSION="0.1.0"
+GHAM_HOME="${GHAM_HOME:-$HOME/.gham}"
+ACCOUNTS="$GHAM_HOME/accounts"
+DEFAULT_FILE="$GHAM_HOME/default"
+BINDS_FILE="$GHAM_HOME/binds"
+GHAM_BIN="$GHAM_HOME/bin"
+GH_SHARED="${GHAM_GH_SHARED_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/gh}"
+CONF_KEYS=(login host name email ssh_key)
+
+die()  { printf 'gham: %s\n' "$*" >&2; exit 1; }
+info() { printf '%s\n' "$*" >&2; }
+
+valid_name() { [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || die "invalid account name '$1' (letters, digits, . _ -)"; }
+acct_dir()   { printf '%s/%s' "$ACCOUNTS" "$1"; }
+exists()     { [[ -d "$ACCOUNTS/$1" ]]; }
+need()       { valid_name "$1"; exists "$1" || die "no such account '$1' — see 'gham list'"; }
+default_account() { if [[ -s "$DEFAULT_FILE" ]]; then local d; read -r d < "$DEFAULT_FILE" || true; printf '%s' "$d"; fi; }
+
+# ------------------------------------------------------------ account.conf
+
+# Load an account's settings into C_<key>. No subshells: the shims run this
+# on every git call.
+load_conf() {
+  local k v f="$ACCOUNTS/$1/account.conf"
+  for k in "${CONF_KEYS[@]}"; do printf -v "C_$k" '%s' ""; done
+  C_host=github.com
+  [[ -f "$f" ]] || return 0
+  while IFS='=' read -r k v || [[ -n "$k" ]]; do
+    case "$k" in login|host|name|email|ssh_key) printf -v "C_$k" '%s' "$v" ;; esac
+  done < "$f"
+}
+
+save_conf() {
+  local f="$ACCOUNTS/$1/account.conf" k v
+  {
+    echo "# gham account — edit with: gham set $1 <key> <value>"
+    for k in "${CONF_KEYS[@]}"; do v="C_$k"; printf '%s=%s\n' "$k" "${!v}"; done
+  } > "$f.tmp"
+  chmod 600 "$f.tmp"; mv "$f.tmp" "$f"
+}
+
+# ------------------------------------------------------------ real binaries
+
+# First <prog> on PATH that is not one of our shims. -ef compares inodes, so
+# this needs no subshell per PATH entry.
+real_bin() {
+  local prog="$1" override="$2" IFS=: d
+  if [[ -n "$override" ]]; then printf '%s' "$override"; return; fi
+  for d in $PATH; do
+    [[ -z "$d" || ! -x "$d/$prog" || -d "$d/$prog" ]] && continue
+    [[ "$d/$prog" -ef "$GHAM_BIN/gham" ]] && continue
+    printf '%s' "$d/$prog"; return
+  done
+  return 1
+}
+real_git() { real_bin git "${GHAM_GIT_BIN:-}" || die "cannot find the real git binary (set GHAM_GIT_BIN)"; }
+real_gh()  { real_bin gh "${GHAM_GH_BIN:-}" || die "cannot find the real gh binary (set GHAM_GH_BIN)"; }
+
+# ------------------------------------------------------------ resolution
+
+# Physical path of a directory into P_DIR, without forking.
+phys_dir() {
+  local orig="$PWD"
+  if CDPATH='' builtin cd -P -- "$1" 2>/dev/null; then
+    P_DIR="$PWD"; CDPATH='' builtin cd -- "$orig" 2>/dev/null || true
+  else
+    P_DIR="$1"
+  fi
+}
+
+# The longest bound directory that contains $1: B_DIR and B_NAME.
+bind_lookup() {
+  B_DIR="" B_NAME=""
+  [[ -s "$BINDS_FILE" ]] || return 1
+  phys_dir "$1"
+  local d n
+  while IFS=$'\t' read -r d n || [[ -n "$d" ]]; do
+    [[ -z "$d" || -z "$n" ]] && continue
+    if [[ "$P_DIR" == "$d" || "$d" == / || "$P_DIR" == "$d"/* ]] && ((${#d} > ${#B_DIR})); then
+      B_DIR="$d" B_NAME="$n"
+    fi
+  done < "$BINDS_FILE"
+  [[ -n "$B_NAME" ]]
+}
+
+# The account for work in directory $1 (default: $PWD): R_NAME and R_WHY.
+resolve() {
+  local where="${1:-$PWD}"
+  R_NAME="" R_WHY=""
+  if [[ -n "${GHAM_ACCOUNT_ACTIVE:-}" ]]; then R_NAME="$GHAM_ACCOUNT_ACTIVE" R_WHY="pinned (gham run / GHAM_ACCOUNT_ACTIVE)"
+  elif [[ -n "${GHAM_ACCOUNT:-}" ]]; then R_NAME="$GHAM_ACCOUNT" R_WHY="shell (gham use)"
+  elif bind_lookup "$where"; then R_NAME="$B_NAME" R_WHY="bind $B_DIR"
+  else
+    R_NAME="$(default_account)"; [[ -n "$R_NAME" ]] && R_WHY="default"
+  fi
+  [[ -n "$R_NAME" ]]
+}
+
+# The directory a git command works in, from -C / --git-dir / --work-tree.
+git_workdir() {
+  local d="$PWD" a
+  while (($#)); do
+    a="$1"
+    case "$a" in
+      -C) shift; [[ $# -gt 0 ]] || break; if [[ "$1" == /* ]]; then d="$1"; else d="$d/$1"; fi ;;
+      --git-dir=*|--work-tree=*) a="${a#*=}"; if [[ "$a" == /* ]]; then d="$a"; else d="$PWD/$a"; fi ;;
+      --git-dir|--work-tree) shift; [[ $# -gt 0 ]] || break; if [[ "$1" == /* ]]; then d="$1"; else d="$PWD/$1"; fi ;;
+      -c|--namespace) shift ;;
+      -*) ;;
+      *) break ;;
+    esac
+    shift
+  done
+  # --git-dir may name the .git directory itself; a bind on the work tree still matches.
+  W_DIR="$d"
+}
+
+# ------------------------------------------------------------ environment
+
+_cfg_n=0
+add_cfg() { export "GIT_CONFIG_KEY_$_cfg_n=$1" "GIT_CONFIG_VALUE_$_cfg_n=$2"; _cfg_n=$((_cfg_n + 1)); }
+
+# Export everything that makes git and gh act as account $1.
+apply_env() {
+  local name="$1" dir="$ACCOUNTS/$1"
+  exists "$name" || die "account '$name' (from ${R_WHY:-GHAM_ACCOUNT_ACTIVE}) does not exist — see 'gham list'"
+  export GH_CONFIG_DIR="$dir/gh" GHAM_ACCOUNT_ACTIVE="$name"
+  # A child of an already-configured process: the overrides are inherited.
+  [[ "${GHAM_ENV_APPLIED:-}" == "$name" ]] && return 0
+  load_conf "$name"
+  _cfg_n="${GIT_CONFIG_COUNT:-0}"
+  [[ -n "$C_name" ]] && add_cfg user.name "$C_name"
+  [[ -n "$C_email" ]] && add_cfg user.email "$C_email"
+  if [[ -n "$C_ssh_key" ]]; then
+    add_cfg core.sshCommand "ssh -i $(printf '%q' "$C_ssh_key") -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
+  fi
+  local gh
+  if gh="$(real_bin gh "${GHAM_GH_BIN:-}")"; then
+    add_cfg "credential.https://$C_host.helper" ""
+    add_cfg "credential.https://$C_host.helper" "!$(printf '%q' "$gh") auth git-credential"
+  fi
+  export GIT_CONFIG_COUNT="$_cfg_n" GHAM_ENV_APPLIED="$name"
+}
+
+# Keep the shared gh settings linked into an account.
+link_shared() {
+  local dir="$1/gh"
+  mkdir -p "$dir" "$GH_SHARED"; chmod 700 "$dir"
+  [[ -e "$GH_SHARED/config.yml" ]] || : > "$GH_SHARED/config.yml"
+  if [[ -L "$dir/config.yml" ]]; then
+    [[ "$(readlink "$dir/config.yml")" == "$GH_SHARED/config.yml" ]] && return 0
+    rm -f "$dir/config.yml"
+  elif [[ -e "$dir/config.yml" ]]; then
+    mv "$dir/config.yml" "$dir/config.yml.gham-local.$(date +%s)"
+  fi
+  ln -s "$GH_SHARED/config.yml" "$dir/config.yml"
+}
+
+logged_in() { [[ -f "$ACCOUNTS/$1/gh/hosts.yml" ]] && grep -qE '^[[:space:]]+user:[[:space:]]*[^[:space:]]' "$ACCOUNTS/$1/gh/hosts.yml"; }
+
+# The user gh recorded for this account's host, from hosts.yml.
+hosts_user() {
+  local f="$ACCOUNTS/$1/gh/hosts.yml"
+  [[ -f "$f" ]] || return 0
+  awk -v h="$2:" '$0 ~ "^[^ ]" {in_h = ($1 == h)} in_h && $1 == "user:" {print $2; exit}' "$f"
+}
+
+# Fill login, name and email from the GitHub API after a login.
+fill_from_api() {
+  local name="$1" row login id gname gemail
+  row="$(GH_CONFIG_DIR="$ACCOUNTS/$name/gh" "$(real_gh)" api -H 'Accept: application/vnd.github+json' \
+    --hostname "$C_host" user --jq '[.login, (.id|tostring), (.name // ""), (.email // "")] | @tsv' 2>/dev/null)" || return 1
+  IFS=$'\t' read -r login id gname gemail <<<"$row"
+  [[ -n "$login" ]] || return 1
+  C_login="$login"
+  [[ -n "$C_name" ]] || C_name="${gname:-$login}"
+  if [[ -z "$C_email" ]]; then
+    if [[ -n "$gemail" ]]; then C_email="$gemail"
+    elif [[ "$C_host" == github.com ]]; then C_email="$id+$login@users.noreply.github.com"
+    fi
+  fi
+}
+
+# Generate an ed25519 key for the account and upload it to GitHub.
+make_ssh_key() {
+  local name="$1" dir="$ACCOUNTS/$1/ssh" title
+  title="gham $name ($(hostname 2>/dev/null || echo host))"
+  command -v ssh-keygen >/dev/null || { info "gham: ssh-keygen not found; skipping the SSH key"; return 0; }
+  mkdir -p "$dir"; chmod 700 "$dir"
+  [[ -f "$dir/id_ed25519" ]] || ssh-keygen -q -t ed25519 -N "" -C "gham-$name" -f "$dir/id_ed25519"
+  C_ssh_key="$dir/id_ed25519"
+  if GH_CONFIG_DIR="$ACCOUNTS/$name/gh" "$(real_gh)" ssh-key add "$dir/id_ed25519.pub" --title "$title" >/dev/null 2>&1; then
+    info "Uploaded SSH key '$title' to $C_host."
+  else
+    info "gham: could not upload the SSH key. Add $dir/id_ed25519.pub at https://$C_host/settings/keys"
+  fi
+  GH_CONFIG_DIR="$ACCOUNTS/$name/gh" "$(real_gh)" config set -h "$C_host" git_protocol ssh >/dev/null 2>&1 || true
+}
+
+# ------------------------------------------------------------ commands
+
+cmd_add() {
+  local name="" import=0 login=1 ssh=gen key="" host="" gname="" gemail=""
+  local -a ghargs=()
+  while (($#)); do
+    case "$1" in
+      --import) import=1 ;;
+      --no-login) login=0 ;;
+      --no-ssh) ssh=none ;;
+      --ssh-key) shift; [[ $# -gt 0 ]] || die "add: --ssh-key needs a path"; ssh=path key="$1" ;;
+      --hostname) shift; [[ $# -gt 0 ]] || die "add: --hostname needs a host"; host="$1" ;;
+      --git-name) shift; [[ $# -gt 0 ]] || die "add: --git-name needs a value"; gname="$1" ;;
+      --git-email) shift; [[ $# -gt 0 ]] || die "add: --git-email needs a value"; gemail="$1" ;;
+      --) shift; ghargs=("$@"); break ;;
+      -*) die "add: unknown option $1" ;;
+      *) [[ -z "$name" ]] || die "add: one name only"; name="$1" ;;
+    esac; shift
+  done
+  [[ -n "$name" ]] || die "usage: gham add <name> [--import | --no-login] [--ssh-key PATH | --no-ssh] [--hostname H] [--git-name N] [--git-email E] [-- gh auth login args]"
+  valid_name "$name"
+  exists "$name" && die "account '$name' already exists"
+  if [[ "$ssh" == path ]]; then
+    [[ -f "$key" ]] || die "add: no SSH key at $key"
+    key="$(cd "$(dirname "$key")" && pwd -P)/$(basename "$key")"
+  fi
+
+  local dir; dir="$(acct_dir "$name")"
+  mkdir -p "$dir"; chmod 700 "$dir"
+  link_shared "$dir"
+  load_conf "$name"
+  [[ -n "$host" ]] && C_host="$host"
+  C_name="$gname" C_email="$gemail"
+  [[ "$ssh" == path ]] && C_ssh_key="$key"
+
+  if ((import)); then
+    local git; git="$(real_git)"
+    if [[ -f "$GH_SHARED/hosts.yml" ]]; then
+      cp "$GH_SHARED/hosts.yml" "$dir/gh/hosts.yml"; chmod 600 "$dir/gh/hosts.yml"
+      C_login="$(hosts_user "$name" "$C_host")"
+    fi
+    [[ -n "$C_name" ]] || C_name="$("$git" config --global user.name 2>/dev/null || true)"
+    [[ -n "$C_email" ]] || C_email="$("$git" config --global user.email 2>/dev/null || true)"
+    save_conf "$name"
+    info "Imported the current identity into '$name'${C_login:+ (gh: $C_login)}: ${C_name:-?} <${C_email:-?}>."
+    logged_in "$name" || info "No gh login was found in $GH_SHARED/hosts.yml — run: gham login $name"
+    [[ -n "$C_ssh_key" ]] || info "No SSH key set, so git uses your normal ~/.ssh setup. Pin one with: gham set $name ssh-key <path>"
+  elif ((login)); then
+    save_conf "$name"
+    info "Starting GitHub login for '$name' on $C_host …"
+    local -a scopes=()
+    [[ "$ssh" == gen ]] && scopes=(-s admin:public_key)
+    if GH_CONFIG_DIR="$dir/gh" "$(real_gh)" auth login -h "$C_host" -p https ${scopes[@]+"${scopes[@]}"} ${ghargs[@]+"${ghargs[@]}"}; then
+      fill_from_api "$name" || C_login="$(hosts_user "$name" "$C_host")"
+      [[ "$ssh" == gen ]] && make_ssh_key "$name"
+      save_conf "$name"
+      info "Logged in as ${C_login:-?}. Commits will be authored as: ${C_name:-?} <${C_email:-?}>."
+    else
+      info "Login did not finish — retry with: gham login $name"
+    fi
+  else
+    save_conf "$name"
+    info "Created account '$name' (not logged in). Log in with: gham login $name"
+  fi
+  [[ -z "$(default_account)" ]] && { printf '%s\n' "$name" > "$DEFAULT_FILE"; info "'$name' is now the default."; }
+  return 0
+}
+
+cmd_login() {
+  [[ $# -ge 1 ]] || die "usage: gham login <name> [gh auth login args…]"
+  need "$1"; local name="$1"; shift
+  link_shared "$(acct_dir "$name")"; load_conf "$name"
+  local gh; gh="$(real_gh)"
+  GH_CONFIG_DIR="$(acct_dir "$name")/gh" "$gh" auth login -h "$C_host" -p https "$@"
+  [[ -n "$C_ssh_key" ]] && { GH_CONFIG_DIR="$(acct_dir "$name")/gh" "$gh" config set -h "$C_host" git_protocol ssh >/dev/null 2>&1 || true; }
+  fill_from_api "$name" || C_login="$(hosts_user "$name" "$C_host")"
+  save_conf "$name"
+  info "'$name' is logged in as ${C_login:-?}."
+}
+
+account_names() {
+  shopt -s nullglob; local d
+  for d in "$ACCOUNTS"/*/; do d="${d%/}"; printf '%s\n' "${d##*/}"; done
+  shopt -u nullglob
+}
+
+binds_for() { [[ -s "$BINDS_FILE" ]] && awk -F'\t' -v n="$1" '$2 == n {c++} END {print c+0}' "$BINDS_FILE" || echo 0; }
+
+cmd_list() {
+  if [[ "${1:-}" == "--names" ]]; then account_names; return; fi
+  [[ $# -eq 0 ]] || die "usage: gham list [--names]"
+  local cur="" def n mark who b any=0
+  resolve && cur="$R_NAME"
+  def="$(default_account)"
+  while IFS= read -r n; do
+    [[ -n "$n" ]] || continue
+    any=1; load_conf "$n"
+    mark="  "; [[ "$n" == "$cur" ]] && mark="> "
+    who="${C_login:+$C_login@}$C_host"; logged_in "$n" || who="no-login"
+    b="$(binds_for "$n")"
+    printf '%s%-14s %-8s %-30s %s%s\n' "$mark" "$n" "$([[ "$n" == "$def" ]] && echo default)" \
+      "$who" "${C_email:-?}" "$( ((b)) && printf '  [%s bind%s]' "$b" "$( ((b > 1)) && echo s)")"
+  done < <(account_names)
+  ((any)) || info "No accounts yet. Add one: gham add <name> [--import]"
+}
+
+cmd_current() {
+  local where="${1:-$PWD}"
+  resolve "$where" || { info "No account for $where: no bind, no 'gham use', no default. Run: gham default <name>"; exit 1; }
+  load_conf "$R_NAME"
+  printf '%s  (%s)  %s  %s <%s>\n' "$R_NAME" "$R_WHY" "${C_login:+$C_login@}$C_host" "${C_name:-?}" "${C_email:-?}"
+}
+
+cmd_default() {
+  if [[ $# -eq 0 ]]; then
+    local d; d="$(default_account)"
+    [[ -n "$d" ]] || { info "no default set"; exit 1; }
+    echo "$d"; return
+  fi
+  need "$1"; printf '%s\n' "$1" > "$DEFAULT_FILE"; info "Default account: $1"
+}
+
+# `use` can only change the calling shell through the function `gham init` installs.
+cmd_use() {
+  [[ $# -eq 1 ]] || die "usage: gham use <name>   (or: gham use --default)"
+  if [[ "$1" == "--default" ]]; then echo "unset GHAM_ACCOUNT"; return; fi
+  need "$1"; printf 'export GHAM_ACCOUNT=%q\n' "$1"
+  [[ -n "${GHAM_ACCOUNT_ACTIVE:-}" && "$GHAM_ACCOUNT_ACTIVE" != "$1" ]] && \
+    info "gham: this shell is pinned to '$GHAM_ACCOUNT_ACTIVE' by gham run / gham env, which wins over gham use. Exit that shell first."
+  [[ -n "${GHAM_SHELL_INIT:-}" ]] || info "gham: shell integration is not loaded; add  eval \"\$(gham init)\"  to your shell rc, or run: eval \"\$(gham use $1)\""
+  return 0
+}
+
+cmd_run() {
+  [[ $# -ge 1 ]] || die "usage: gham run <name> [command args…]   (no command: a shell)"
+  local name="$1"; shift
+  need "$name"; link_shared "$(acct_dir "$name")"
+  R_WHY="gham run"; apply_env "$name"
+  if (($#)); then exec "$@"; else exec "${SHELL:-bash}"; fi
+}
+
+cmd_env() {
+  local name="${1:-}"
+  if [[ -z "$name" ]]; then resolve || die "usage: gham env <name>"; name="$R_NAME"; fi
+  need "$name"; link_shared "$(acct_dir "$name")"
+  local start="${GIT_CONFIG_COUNT:-0}" v i
+  [[ "${GHAM_ENV_APPLIED:-}" == "$name" ]] || unset GHAM_ENV_APPLIED
+  apply_env "$name"
+  for v in GH_CONFIG_DIR GHAM_ACCOUNT_ACTIVE GHAM_ENV_APPLIED GIT_CONFIG_COUNT; do
+    printf 'export %s=%q\n' "$v" "${!v}"
+  done
+  for ((i = start; i < ${GIT_CONFIG_COUNT:-0}; i++)); do
+    v="GIT_CONFIG_KEY_$i"; printf 'export %s=%q\n' "$v" "${!v}"
+    v="GIT_CONFIG_VALUE_$i"; printf 'export %s=%q\n' "$v" "${!v}"
+  done
+}
+
+cmd_bind() {
+  if [[ $# -eq 0 ]]; then cmd_binds; return; fi
+  [[ $# -eq 2 ]] || die "usage: gham bind <dir> <name>   (e.g. gham bind ~/Codes/work work)"
+  [[ -d "$1" ]] || die "bind: no such directory '$1'"
+  need "$2"
+  local d; d="$(cd "$1" && pwd -P)"
+  [[ "$d" != *$'\t'* && "$d" != *$'\n'* ]] || die "bind: directory names with tabs or newlines are not supported"
+  local tmp="$BINDS_FILE.tmp"
+  { [[ -f "$BINDS_FILE" ]] && awk -F'\t' -v d="$d" '$1 != d' "$BINDS_FILE"; printf '%s\t%s\n' "$d" "$2"; } > "$tmp"
+  mv "$tmp" "$BINDS_FILE"
+  info "Bound $d → $2"
+}
+
+cmd_unbind() {
+  [[ $# -eq 1 ]] || die "usage: gham unbind <dir>"
+  local d; if [[ -d "$1" ]]; then d="$(cd "$1" && pwd -P)"; else d="${1%/}"; fi
+  [[ -f "$BINDS_FILE" ]] && awk -F'\t' -v d="$d" '$1 == d {f = 1} END {exit !f}' "$BINDS_FILE" || die "unbind: $d is not bound"
+  awk -F'\t' -v d="$d" '$1 != d' "$BINDS_FILE" > "$BINDS_FILE.tmp" && mv "$BINDS_FILE.tmp" "$BINDS_FILE"
+  info "Unbound $d"
+}
+
+cmd_binds() {
+  [[ -s "$BINDS_FILE" ]] || { info "No directory binds. Add one: gham bind <dir> <name>"; return 0; }
+  sort "$BINDS_FILE" | awk -F'\t' '{printf "%-50s %s\n", $1, $2}'
+}
+
+cmd_set() {
+  [[ $# -ge 1 ]] || die "usage: gham set <name> [<key> <value>]   keys: name email ssh-key host login"
+  need "$1"; local name="$1"; shift
+  load_conf "$name"
+  if [[ $# -eq 0 ]]; then
+    local k v; for k in "${CONF_KEYS[@]}"; do v="C_$k"; printf '%-8s %s\n' "${k/_/-}" "${!v}"; done
+    return
+  fi
+  [[ $# -eq 2 ]] || die "usage: gham set <name> <key> <value>"
+  local key="${1//-/_}" val="$2"
+  case "$key" in
+    name|email|host|login) ;;
+    ssh_key)
+      if [[ "$val" == none || -z "$val" ]]; then val=""
+      else [[ -f "$val" ]] || die "set: no SSH key at $val"; val="$(cd "$(dirname "$val")" && pwd -P)/$(basename "$val")"; fi ;;
+    *) die "set: unknown key '$1' (name, email, ssh-key, host, login)" ;;
+  esac
+  printf -v "C_$key" '%s' "$val"
+  save_conf "$name"
+  info "$name: ${1} = ${val:-(none)}"
+}
+
+cmd_remove() {
+  local name="" yes=0
+  while (($#)); do case "$1" in -y|--yes) yes=1 ;; *) name="$1" ;; esac; shift; done
+  [[ -n "$name" ]] || die "usage: gham remove <name> [-y]"
+  need "$name"; load_conf "$name"
+  if ((!yes)); then
+    read -r -p "Remove account '$name' (${C_login:-no login}@$C_host) and its local login and key? [y/N] " a
+    [[ "$a" == [yY]* ]] || { info "aborted"; exit 1; }
+  fi
+  local dir; dir="$(acct_dir "$name")"
+  # Drops a keyring-stored token; the token itself stays valid on GitHub.
+  if logged_in "$name"; then
+    GH_CONFIG_DIR="$dir/gh" "$(real_gh)" auth logout -h "$C_host" ${C_login:+-u "$C_login"} >/dev/null 2>&1 || true
+  fi
+  find "$dir" -mindepth 1 -maxdepth 2 -type l -delete
+  rm -rf -- "$dir"
+  if [[ -f "$BINDS_FILE" ]]; then awk -F'\t' -v n="$name" '$2 != n' "$BINDS_FILE" > "$BINDS_FILE.tmp" && mv "$BINDS_FILE.tmp" "$BINDS_FILE"; fi
+  [[ "$(default_account)" == "$name" ]] && rm -f "$DEFAULT_FILE" && info "'$name' was the default; set a new one with: gham default <name>"
+  info "Removed '$name'. A key gham uploaded stays on GitHub until you delete it at https://$C_host/settings/keys"
+}
+
+cmd_rename() {
+  [[ $# -eq 2 ]] || die "usage: gham rename <old> <new>"
+  need "$1"; valid_name "$2"; exists "$2" && die "account '$2' already exists"
+  mv "$(acct_dir "$1")" "$(acct_dir "$2")"
+  link_shared "$(acct_dir "$2")"
+  load_conf "$2"
+  if [[ "$C_ssh_key" == "$(acct_dir "$1")/"* ]]; then C_ssh_key="$(acct_dir "$2")/${C_ssh_key#"$(acct_dir "$1")/"}"; save_conf "$2"; fi
+  if [[ -f "$BINDS_FILE" ]]; then awk -F'\t' -v o="$1" -v n="$2" 'BEGIN{OFS="\t"} $2 == o {$2 = n} {print}' "$BINDS_FILE" > "$BINDS_FILE.tmp" && mv "$BINDS_FILE.tmp" "$BINDS_FILE"; fi
+  [[ "$(default_account)" == "$1" ]] && printf '%s\n' "$2" > "$DEFAULT_FILE"
+  info "Renamed '$1' → '$2'."
+}
+
+# Talks to GitHub: checks the gh token and the SSH key really are this account.
+cmd_verify() {
+  local name="${1:-}"
+  if [[ -z "$name" ]]; then resolve || die "usage: gham verify <name>"; name="$R_NAME"; fi
+  need "$name"; load_conf "$name"
+  local ok=0 who
+  if who="$(GH_CONFIG_DIR="$(acct_dir "$name")/gh" "$(real_gh)" api --hostname "$C_host" user --jq .login 2>/dev/null)"; then
+    echo "gh token   ok — $who"
+    [[ -z "$C_login" || "$who" == "$C_login" ]] || { echo "           but account.conf says '$C_login'"; ok=1; }
+  else
+    echo "gh token   FAILED — run: gham login $name"; ok=1
+  fi
+  if [[ -n "$C_ssh_key" ]]; then
+    local out; out="$(ssh -i "$C_ssh_key" -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -o BatchMode=yes -T "git@$C_host" 2>&1 || true)"
+    if [[ "$out" =~ Hi\ ([^!]+)! ]]; then
+      echo "ssh key    ok — ${BASH_REMATCH[1]}"
+      [[ -z "$C_login" || "${BASH_REMATCH[1]}" == "$C_login" ]] || { echo "           but this key belongs to a different GitHub user"; ok=1; }
+    else
+      echo "ssh key    FAILED — ${out##*$'\n'}"; ok=1
+    fi
+  else
+    echo "ssh key    not set — git uses your normal ~/.ssh setup"
+  fi
+  echo "git author ${C_name:-?} <${C_email:-?}>"
+  return "$ok"
+}
+
+cmd_doctor() {
+  local g h
+  echo "GHAM_HOME     $GHAM_HOME"
+  echo "shared gh     $GH_SHARED"
+  g="$(real_bin git "${GHAM_GIT_BIN:-}" || echo none)"; h="$(real_bin gh "${GHAM_GH_BIN:-}" || echo none)"
+  echo "real git      $g ($("$g" --version 2>/dev/null || echo '?'))"
+  echo "real gh       $h ($("$h" --version 2>/dev/null | head -1 || echo '?'))"
+  echo "git shim      $([[ "$(command -v git)" == "$GHAM_BIN/git" ]] && echo "on PATH" || echo "no — $(command -v git || echo none) wins; add: eval \"\$(gham init)\"")"
+  echo "gh shim       $([[ "$(command -v gh)" == "$GHAM_BIN/gh" ]] && echo "on PATH" || echo "no — $(command -v gh || echo none) wins; add: eval \"\$(gham init)\"")"
+  echo "shell init    $([[ -n "${GHAM_SHELL_INIT:-}" ]] && echo loaded || echo "not loaded")"
+  if resolve; then echo "resolves to   $R_NAME ($R_WHY)"; else echo "resolves to   nothing (git and gh pass straight through)"; fi
+  if [[ "$g" != none ]]; then
+    local v; v="$("$g" --version | awk '{print $3}')"
+    [[ "$(printf '%s\n2.31.0\n' "$v" | sort -V | head -1)" == 2.31.0 ]] || echo "WARNING       git $v is older than 2.31, which ignores GIT_CONFIG_COUNT: identity switching will not work"
+  fi
+  [[ -n "${GH_TOKEN:-}${GITHUB_TOKEN:-}" ]] && echo "WARNING       GH_TOKEN / GITHUB_TOKEN is set: gh uses it for every account"
+  [[ -n "${GIT_SSH_COMMAND:-}" ]] && echo "WARNING       GIT_SSH_COMMAND is set: it overrides each account's SSH key"
+  echo
+  cmd_list
+  echo
+  cmd_binds
+}
+
+cmd_init() {
+  local shell="${1:-$(basename "${SHELL:-bash}")}"
+  case "$shell" in zsh|bash) ;; *) die "init: supported shells are zsh and bash" ;; esac
+  cat <<EOF
+# gham shell integration ($shell)
+export GHAM_HOME=$(printf '%q' "$GHAM_HOME")
+case ":\$PATH:" in *":\$GHAM_HOME/bin:"*) ;; *) export PATH="\$GHAM_HOME/bin:\$PATH" ;; esac
+export GHAM_SHELL_INIT=1
+gham() {
+  case "\${1:-}" in
+    use) local _gham_out; _gham_out="\$(command gham "\$@")" && eval "\$_gham_out" && command gham current ;;
+    *) command gham "\$@" ;;
+  esac
+}
+EOF
+  if [[ "$shell" == zsh ]]; then completion_zsh; else completion_bash; fi
+}
+
+GHAM_COMMANDS="add login list ls use default current run env bind unbind binds set rename mv remove rm verify doctor init version help"
+
+completion_bash() {
+  cat <<EOF
+_gham_complete() {
+  local cur="\${COMP_WORDS[COMP_CWORD]}" cmd="\${COMP_WORDS[1]:-}" i="\$COMP_CWORD" w=""
+  if ((i == 1)); then
+    w="$GHAM_COMMANDS"
+  else
+    case "\$cmd" in
+      login|default|env|run|rename|mv|verify) ((i == 2)) && w="\$(command gham list --names 2>/dev/null)" ;;
+      use) ((i == 2)) && w="\$(command gham list --names 2>/dev/null) --default" ;;
+      set) ((i == 2)) && w="\$(command gham list --names 2>/dev/null)"; ((i == 3)) && w="name email ssh-key host login" ;;
+      remove|rm) w="\$(command gham list --names 2>/dev/null) -y --yes" ;;
+      bind) if ((i == 2)); then COMPREPLY=(\$(compgen -d -- "\$cur")); return; fi; ((i == 3)) && w="\$(command gham list --names 2>/dev/null)" ;;
+      unbind) ((i == 2)) && w="\$(cut -f1 "\$GHAM_HOME/binds" 2>/dev/null)" ;;
+      add) w="--import --no-login --no-ssh --ssh-key --hostname --git-name --git-email" ;;
+      list|ls) ((i == 2)) && w="--names" ;;
+      init) ((i == 2)) && w="zsh bash" ;;
+    esac
+  fi
+  COMPREPLY=(\$(compgen -W "\$w" -- "\$cur"))
+}
+complete -F _gham_complete gham
+EOF
+}
+
+completion_zsh() {
+  cat <<'EOF'
+_gham() {
+  local -a cmds names
+  cmds=(
+    'add:register an account' 'login:log an account in again' 'list:list accounts'
+    'use:switch this shell to an account' 'default:show or set the default account'
+    'current:which account git and gh use here' 'run:run a command as an account'
+    'env:print the exports for scripts' 'bind:bind a directory to an account'
+    'unbind:remove a directory bind' 'binds:list directory binds'
+    'set:show or change an account'"'"'s settings' 'rename:rename an account'
+    'remove:delete an account' 'verify:check the token and SSH key against GitHub'
+    'doctor:check the setup' 'init:print shell integration'
+    'version:print the gham version' 'help:show usage'
+  )
+  if (( CURRENT == 2 )); then _describe -t commands 'gham command' cmds; return; fi
+  names=(${(f)"$(command gham list --names 2>/dev/null)"})
+  case $words[2] in
+    login|default|env|run|rename|mv|verify) (( CURRENT == 3 )) && compadd -a names ;;
+    use) (( CURRENT == 3 )) && { compadd -a names; compadd -- --default; } ;;
+    set) (( CURRENT == 3 )) && compadd -a names; (( CURRENT == 4 )) && compadd -- name email ssh-key host login ;;
+    remove|rm) compadd -a names; compadd -- -y --yes ;;
+    bind) (( CURRENT == 3 )) && _directories; (( CURRENT == 4 )) && compadd -a names ;;
+    unbind) (( CURRENT == 3 )) && compadd -- ${(f)"$(cut -f1 "$GHAM_HOME/binds" 2>/dev/null)"} ;;
+    add) compadd -- --import --no-login --no-ssh --ssh-key --hostname --git-name --git-email ;;
+    list|ls) (( CURRENT == 3 )) && compadd -- --names ;;
+    init) (( CURRENT == 3 )) && compadd -- zsh bash ;;
+  esac
+}
+if (( $+functions[compdef] )); then
+  compdef _gham gham
+else
+  autoload -Uz compinit && compinit -C && compdef _gham gham
+fi
+EOF
+}
+
+usage() {
+  cat <<'EOF'
+gham — GitHub Account Manager
+
+  gham add <name>              register an account: gh login, git identity, a new SSH key uploaded to GitHub
+      --import                   take the current gh login and git user instead of logging in
+      --ssh-key PATH | --no-ssh  use an existing key, or leave SSH to ~/.ssh
+      --git-name N --git-email E --hostname H --no-login   [-- extra gh auth login args]
+  gham login <name>            (re)log in an account's gh
+  gham list [--names]          list accounts  (> = what git and gh use here)
+  gham use <name>              switch this shell to <name>  (gham use --default to clear)
+  gham bind <dir> <name>       use <name> for git and gh anywhere under <dir>
+  gham unbind <dir>            remove a bind;  gham binds  lists them
+  gham default [name]          show or set the machine-wide default
+  gham current [dir]           which account git and gh use here, and why
+  gham run <name> [cmd…]       run a command (or a shell) as <name>, overriding binds
+  gham env [name]              print the exports for scripts:  eval "$(gham env work)"
+  gham set <name> [key value]  show or change name, email, ssh-key, host, login
+  gham rename <old> <new>      rename an account (binds and the default follow)
+  gham remove <name> [-y]      delete an account's local login and key
+  gham verify [name]           check the gh token and SSH key against GitHub
+  gham doctor                  check the setup
+  gham init [zsh|bash]         shell integration — add to your rc:  eval "$(gham init)"
+  gham version                 print the gham version
+
+Order: gham run > gham use > the longest gham bind > the default.
+EOF
+}
+
+# --------------------------------------------------------------- dispatch
+
+case "${0##*/}" in
+  git)
+    git_workdir "$@"
+    if resolve "$W_DIR"; then apply_env "$R_NAME"; fi
+    exec "$(real_git)" "$@" ;;
+  gh)
+    if resolve; then
+      apply_env "$R_NAME"
+      [[ -L "$GH_CONFIG_DIR/config.yml" ]] || link_shared "$ACCOUNTS/$R_NAME"
+    fi
+    exec "$(real_gh)" "$@" ;;
+esac
+
+mkdir -p "$ACCOUNTS"
+cmd="${1:-help}"; shift || true
+case "$cmd" in
+  add) cmd_add "$@" ;;
+  login) cmd_login "$@" ;;
+  list|ls) cmd_list "$@" ;;
+  use) cmd_use "$@" ;;
+  default) cmd_default "$@" ;;
+  current) cmd_current "$@" ;;
+  run) cmd_run "$@" ;;
+  env) cmd_env "$@" ;;
+  bind) cmd_bind "$@" ;;
+  unbind) cmd_unbind "$@" ;;
+  binds) cmd_binds ;;
+  set) cmd_set "$@" ;;
+  remove|rm) cmd_remove "$@" ;;
+  rename|mv) cmd_rename "$@" ;;
+  verify) cmd_verify "$@" ;;
+  doctor) cmd_doctor ;;
+  init) cmd_init "$@" ;;
+  version|-v|--version) echo "gham $GHAM_VERSION" ;;
+  help|-h|--help) usage ;;
+  *) usage >&2; exit 1 ;;
+esac

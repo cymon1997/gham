@@ -1,0 +1,28 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: ShellCheck
+        run: shellcheck gham install.sh tests/*.sh
+
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install bash 5 (macOS ships 3.2)
+        if: runner.os == 'macOS'
+        run: brew install bash
+      - name: Smoke tests
+        run: bash ./tests/smoke.sh
