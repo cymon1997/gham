@@ -4,6 +4,21 @@ All notable changes to gham are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [0.2.0] — 2026-11-10
+
+### Added
+- Owner binds: `gham owner <owner> <name> [--hostname H]`, `gham unowner`, `gham owners`. git picks
+  the account from the repository's remote (origin, else the first remote) or from the URL being
+  cloned, before directory binds. It reads `.git` dirs, linked worktrees, submodules and bare
+  repos without forking. gh keeps following directory binds.
+- `gham current` shows gh's account too when it differs from git's; `gham doctor` shows both and
+  lists owner binds; `gham list` counts owners.
+
+### Changed
+- The shims dispatch before the command definitions and look up the real binaries without forking,
+  which halves their overhead per call.
+- `rename` and `remove` keep owner binds in step.
+
 ## [0.1.0] — 2026-11-10
 
 ### Added

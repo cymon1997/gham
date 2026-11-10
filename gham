@@ -22,15 +22,17 @@
 #   writes there.
 #
 #   Resolution order: GHAM_ACCOUNT_ACTIVE (set by `gham run` and passed on to
-#   child processes) > GHAM_ACCOUNT (`gham use`) > the longest `gham bind`
-#   directory containing the working directory > the default.
+#   child processes) > GHAM_ACCOUNT (`gham use`) > for git only, a `gham owner`
+#   matching the repository's remote (or the URL being cloned) > the longest
+#   `gham bind` directory containing the working directory > the default.
 set -euo pipefail
 
-GHAM_VERSION="0.1.0"
+GHAM_VERSION="0.2.0"
 GHAM_HOME="${GHAM_HOME:-$HOME/.gham}"
 ACCOUNTS="$GHAM_HOME/accounts"
 DEFAULT_FILE="$GHAM_HOME/default"
 BINDS_FILE="$GHAM_HOME/binds"
+OWNERS_FILE="$GHAM_HOME/owners"
 GHAM_BIN="$GHAM_HOME/bin"
 GH_SHARED="${GHAM_GH_SHARED_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/gh}"
 CONF_KEYS=(login host name email ssh_key)
@@ -71,16 +73,19 @@ save_conf() {
 
 # First <prog> on PATH that is not one of our shims. -ef compares inodes, so
 # this needs no subshell per PATH entry.
-real_bin() {
+# find_bin sets RB without forking (the shims use it); real_bin prints it.
+find_bin() {
   local prog="$1" override="$2" IFS=: d
-  if [[ -n "$override" ]]; then printf '%s' "$override"; return; fi
+  RB=""
+  if [[ -n "$override" ]]; then RB="$override"; return 0; fi
   for d in $PATH; do
     [[ -z "$d" || ! -x "$d/$prog" || -d "$d/$prog" ]] && continue
     [[ "$d/$prog" -ef "$GHAM_BIN/gham" ]] && continue
-    printf '%s' "$d/$prog"; return
+    RB="$d/$prog"; return 0
   done
   return 1
 }
+real_bin() { find_bin "$@" && printf '%s' "$RB"; }
 real_git() { real_bin git "${GHAM_GIT_BIN:-}" || die "cannot find the real git binary (set GHAM_GIT_BIN)"; }
 real_gh()  { real_bin gh "${GHAM_GH_BIN:-}" || die "cannot find the real gh binary (set GHAM_GH_BIN)"; }
 
@@ -111,15 +116,100 @@ bind_lookup() {
   [[ -n "$B_NAME" ]]
 }
 
+# "host/owner" (lowercase) of a remote URL into U_KEY: scp-style
+# git@host:owner/repo, ssh://user@host:port/owner/repo, https://host/owner/repo.
+url_owner() {
+  local u="$1" host rest
+  U_KEY=""
+  if [[ "$u" == *://* ]]; then
+    u="${u#*://}"; host="${u%%/*}"; rest="${u#*/}"
+    [[ "$rest" == "$u" ]] && return 1
+    host="${host##*@}"; host="${host%%:*}"
+  elif [[ "$u" == *:* && "${u%%:*}" != */* ]]; then
+    host="${u%%:*}"; rest="${u#*:}"; host="${host##*@}"
+  else
+    return 1
+  fi
+  rest="${rest#/}"; rest="${rest%%/*}"
+  [[ -n "$host" && -n "$rest" ]] || return 1
+  U_KEY="${host,,}/${rest,,}"
+}
+
+# The config file of the repository containing directory $1 into G_CONFIG:
+# a work tree's .git, a linked worktree's or submodule's gitdir (via
+# commondir), or a bare repository. Walks up without forking.
+repo_config() {
+  local d="$1" gd line common
+  G_CONFIG=""
+  if [[ -n "${GIT_DIR:-}" ]]; then d="$GIT_DIR"; [[ "$d" == /* ]] || d="$PWD/$d"; fi
+  while [[ -n "$d" ]]; do
+    if [[ -d "$d/.git" ]]; then G_CONFIG="$d/.git/config"; break
+    elif [[ -f "$d/.git" ]]; then
+      read -r line < "$d/.git" || true
+      gd="${line#gitdir: }"; [[ "$gd" == /* ]] || gd="$d/$gd"
+      common="$gd"
+      if [[ -f "$gd/commondir" ]]; then
+        read -r common < "$gd/commondir" || true
+        [[ "$common" == /* ]] || common="$gd/$common"
+      fi
+      G_CONFIG="$common/config"; break
+    elif [[ -f "$d/HEAD" && -f "$d/config" && -d "$d/objects" ]]; then G_CONFIG="$d/config"; break
+    fi
+    [[ "$d" == / ]] && break
+    d="${d%/*}"; [[ -n "$d" ]] || d=/
+  done
+  [[ -n "$G_CONFIG" && -f "$G_CONFIG" ]]
+}
+
+# The remote URL of that repository: origin's, else the first remote's.
+repo_remote_url() {
+  local line sect="" first="" origin="" k v
+  G_URL=""
+  repo_config "$1" || return 1
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line#"${line%%[![:space:]]*}"}"
+    case "$line" in
+      \[*) sect="$line" ;;
+      url*=*)
+        [[ "$sect" == '[remote '* ]] || continue
+        k="${line%%=*}"; k="${k%"${k##*[![:space:]]}"}"; [[ "$k" == url ]] || continue
+        v="${line#*=}"; v="${v#"${v%%[![:space:]]*}"}"; v="${v%"${v##*[![:space:]]}"}"
+        [[ -n "$first" ]] || first="$v"
+        [[ "$sect" == '[remote "origin"]' && -z "$origin" ]] && origin="$v" ;;
+    esac
+  done < "$G_CONFIG"
+  G_URL="${origin:-$first}"
+  [[ -n "$G_URL" ]]
+}
+
+# The account bound to the owner of git's remote: O_NAME, O_KEY, O_URL.
+# Uses the URL being cloned when there is one, else the repo's remote.
+owner_lookup() {
+  O_NAME="" O_KEY="" O_URL=""
+  [[ -s "$OWNERS_FILE" ]] || return 1
+  if [[ -n "${W_URL:-}" ]]; then O_URL="$W_URL"
+  elif repo_remote_url "$1"; then O_URL="$G_URL"
+  else return 1
+  fi
+  url_owner "$O_URL" || return 1
+  local k n
+  while IFS=$'\t' read -r k n || [[ -n "$k" ]]; do
+    [[ "$k" == "$U_KEY" && -n "$n" ]] && { O_NAME="$n" O_KEY="$k"; return 0; }
+  done < "$OWNERS_FILE"
+  return 1
+}
+
 # The account for work in directory $1 (default: $PWD): R_NAME and R_WHY.
+# With $2 == git, the owner of the repository's remote counts before binds.
 resolve() {
-  local where="${1:-$PWD}"
+  local where="${1:-$PWD}" tool="${2:-gh}"
   R_NAME="" R_WHY=""
   if [[ -n "${GHAM_ACCOUNT_ACTIVE:-}" ]]; then R_NAME="$GHAM_ACCOUNT_ACTIVE" R_WHY="pinned (gham run / GHAM_ACCOUNT_ACTIVE)"
   elif [[ -n "${GHAM_ACCOUNT:-}" ]]; then R_NAME="$GHAM_ACCOUNT" R_WHY="shell (gham use)"
+  elif [[ "$tool" == git ]] && owner_lookup "$where"; then R_NAME="$O_NAME" R_WHY="owner $O_KEY"
   elif bind_lookup "$where"; then R_NAME="$B_NAME" R_WHY="bind $B_DIR"
-  else
-    R_NAME="$(default_account)"; [[ -n "$R_NAME" ]] && R_WHY="default"
+  elif [[ -s "$DEFAULT_FILE" ]]; then
+    read -r R_NAME < "$DEFAULT_FILE" || true; [[ -n "$R_NAME" ]] && R_WHY="default"
   fi
   [[ -n "$R_NAME" ]]
 }
@@ -140,7 +230,22 @@ git_workdir() {
     shift
   done
   # --git-dir may name the .git directory itself; a bind on the work tree still matches.
-  W_DIR="$d"
+  W_DIR="$d" W_URL=""
+  # `git clone <url>` has no repository yet: the URL names the owner.
+  if [[ "${1:-}" == clone ]]; then
+    shift
+    while (($#)); do
+      case "$1" in
+        --) shift; [[ $# -gt 0 ]] && W_URL="$1"; break ;;
+        -o|-b|-u|-c|-j|--origin|--branch|--upload-pack|--reference|--reference-if-able|--depth|\
+        --shallow-since|--shallow-exclude|--template|--separate-git-dir|--config|--jobs|--filter|\
+        --server-option|--bundle-uri|--ref-format) shift ;;
+        -*) ;;
+        *) W_URL="$1"; break ;;
+      esac
+      shift
+    done
+  fi
 }
 
 # ------------------------------------------------------------ environment
@@ -160,12 +265,14 @@ apply_env() {
   [[ -n "$C_name" ]] && add_cfg user.name "$C_name"
   [[ -n "$C_email" ]] && add_cfg user.email "$C_email"
   if [[ -n "$C_ssh_key" ]]; then
-    add_cfg core.sshCommand "ssh -i $(printf '%q' "$C_ssh_key") -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
+    local k; printf -v k '%q' "$C_ssh_key"
+    add_cfg core.sshCommand "ssh -i $k -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
   fi
-  local gh
-  if gh="$(real_bin gh "${GHAM_GH_BIN:-}")"; then
+  local q
+  if find_bin gh "${GHAM_GH_BIN:-}"; then
+    printf -v q '%q' "$RB"
     add_cfg "credential.https://$C_host.helper" ""
-    add_cfg "credential.https://$C_host.helper" "!$(printf '%q' "$gh") auth git-credential"
+    add_cfg "credential.https://$C_host.helper" "!$q auth git-credential"
   fi
   export GIT_CONFIG_COUNT="$_cfg_n" GHAM_ENV_APPLIED="$name"
 }
@@ -224,6 +331,25 @@ make_ssh_key() {
   fi
   GH_CONFIG_DIR="$ACCOUNTS/$name/gh" "$(real_gh)" config set -h "$C_host" git_protocol ssh >/dev/null 2>&1 || true
 }
+
+# ------------------------------------------------------------ shims
+
+# Dispatched here, before the command definitions below, so a shim never
+# parses them: bash reads a script as it runs it, and exec ends the read.
+case "${0##*/}" in
+  git)
+    git_workdir "$@"
+    if resolve "$W_DIR" git; then apply_env "$R_NAME"; fi
+    find_bin git "${GHAM_GIT_BIN:-}" || die "cannot find the real git binary (set GHAM_GIT_BIN)"
+    exec "$RB" "$@" ;;
+  gh)
+    if resolve; then
+      apply_env "$R_NAME"
+      [[ -L "$GH_CONFIG_DIR/config.yml" ]] || link_shared "$ACCOUNTS/$R_NAME"
+    fi
+    find_bin gh "${GHAM_GH_BIN:-}" || die "cannot find the real gh binary (set GHAM_GH_BIN)"
+    exec "$RB" "$@" ;;
+esac
 
 # ------------------------------------------------------------ commands
 
@@ -312,30 +438,41 @@ account_names() {
 }
 
 binds_for() { [[ -s "$BINDS_FILE" ]] && awk -F'\t' -v n="$1" '$2 == n {c++} END {print c+0}' "$BINDS_FILE" || echo 0; }
+owners_for() { [[ -s "$OWNERS_FILE" ]] && awk -F'\t' -v n="$1" '$2 == n {c++} END {print c+0}' "$OWNERS_FILE" || echo 0; }
 
 cmd_list() {
   if [[ "${1:-}" == "--names" ]]; then account_names; return; fi
   [[ $# -eq 0 ]] || die "usage: gham list [--names]"
-  local cur="" def n mark who b any=0
-  resolve && cur="$R_NAME"
+  local cur="" def n mark who b o tags any=0
+  resolve "$PWD" git && cur="$R_NAME"
   def="$(default_account)"
   while IFS= read -r n; do
     [[ -n "$n" ]] || continue
     any=1; load_conf "$n"
     mark="  "; [[ "$n" == "$cur" ]] && mark="> "
     who="${C_login:+$C_login@}$C_host"; logged_in "$n" || who="no-login"
-    b="$(binds_for "$n")"
+    b="$(binds_for "$n")" o="$(owners_for "$n")" tags=""
+    if ((b)); then tags="$b bind"; ((b > 1)) && tags+=s; fi
+    if ((o)); then tags+="${tags:+, }$o owner"; ((o > 1)) && tags+=s; fi
     printf '%s%-14s %-8s %-30s %s%s\n' "$mark" "$n" "$([[ "$n" == "$def" ]] && echo default)" \
-      "$who" "${C_email:-?}" "$( ((b)) && printf '  [%s bind%s]' "$b" "$( ((b > 1)) && echo s)")"
+      "$who" "${C_email:-?}" "${tags:+  [$tags]}"
   done < <(account_names)
   ((any)) || info "No accounts yet. Add one: gham add <name> [--import]"
 }
 
+# git can differ from gh here: git also looks at the repository's remote owner.
 cmd_current() {
-  local where="${1:-$PWD}"
-  resolve "$where" || { info "No account for $where: no bind, no 'gham use', no default. Run: gham default <name>"; exit 1; }
-  load_conf "$R_NAME"
-  printf '%s  (%s)  %s  %s <%s>\n' "$R_NAME" "$R_WHY" "${C_login:+$C_login@}$C_host" "${C_name:-?}" "${C_email:-?}"
+  local where="${1:-$PWD}" gn gw
+  [[ -d "$where" ]] || die "current: no such directory '$where'"
+  where="$(cd "$where" && pwd -P)"
+  resolve "$where" git || { info "No account for $where: no owner, no bind, no 'gham use', no default. Run: gham default <name>"; exit 1; }
+  gn="$R_NAME" gw="$R_WHY"
+  load_conf "$gn"
+  printf '%s  (%s)  %s  %s <%s>\n' "$gn" "$gw" "${C_login:+$C_login@}$C_host" "${C_name:-?}" "${C_email:-?}"
+  if resolve "$where" gh && [[ "$R_NAME" != "$gn" ]]; then
+    load_conf "$R_NAME"
+    printf '  gh here: %s  (%s)  %s\n' "$R_NAME" "$R_WHY" "${C_login:+$C_login@}$C_host"
+  fi
 }
 
 cmd_default() {
@@ -408,6 +545,47 @@ cmd_binds() {
   sort "$BINDS_FILE" | awk -F'\t' '{printf "%-50s %s\n", $1, $2}'
 }
 
+# Owner keys are "host/owner", lowercase; a bare owner means github.com.
+owner_key() {
+  local o="${1,,}" host="${2:-github.com}"
+  o="${o#https://}"; o="${o%/}"
+  [[ "$o" == */* ]] || o="${host,,}/$o"
+  [[ "$o" =~ ^[a-z0-9.-]+/[a-z0-9._-]+$ ]] || die "owner: '$1' is not an owner name (e.g. tiket, or ghe.example.com/team)"
+  printf '%s' "$o"
+}
+
+cmd_owner() {
+  if [[ $# -eq 0 ]]; then cmd_owners; return; fi
+  local owner="" name="" host=""
+  while (($#)); do
+    case "$1" in
+      --hostname) shift; [[ $# -gt 0 ]] || die "owner: --hostname needs a host"; host="$1" ;;
+      -*) die "owner: unknown option $1" ;;
+      *) if [[ -z "$owner" ]]; then owner="$1"; elif [[ -z "$name" ]]; then name="$1"; else die "usage: gham owner <owner> <name>"; fi ;;
+    esac; shift
+  done
+  [[ -n "$owner" && -n "$name" ]] || die "usage: gham owner <owner> <name> [--hostname H]   (e.g. gham owner tiket work)"
+  need "$name"
+  local k; k="$(owner_key "$owner" "$host")"
+  { [[ -f "$OWNERS_FILE" ]] && awk -F'\t' -v k="$k" '$1 != k' "$OWNERS_FILE"; printf '%s\t%s\n' "$k" "$name"; } > "$OWNERS_FILE.tmp"
+  mv "$OWNERS_FILE.tmp" "$OWNERS_FILE"
+  info "git in any repository whose remote is $k/* → $name"
+}
+
+cmd_unowner() {
+  [[ $# -ge 1 ]] || die "usage: gham unowner <owner> [--hostname H]"
+  local host=""; [[ "${2:-}" == --hostname ]] && host="${3:-}"
+  local k; k="$(owner_key "$1" "$host")"
+  [[ -f "$OWNERS_FILE" ]] && awk -F'\t' -v k="$k" '$1 == k {f = 1} END {exit !f}' "$OWNERS_FILE" || die "unowner: $k is not bound"
+  awk -F'\t' -v k="$k" '$1 != k' "$OWNERS_FILE" > "$OWNERS_FILE.tmp" && mv "$OWNERS_FILE.tmp" "$OWNERS_FILE"
+  info "Unbound owner $k"
+}
+
+cmd_owners() {
+  [[ -s "$OWNERS_FILE" ]] || { info "No owner binds. Add one: gham owner <owner> <name>"; return 0; }
+  sort "$OWNERS_FILE" | awk -F'\t' '{printf "%-50s %s\n", $1 "/*", $2}'
+}
+
 cmd_set() {
   [[ $# -ge 1 ]] || die "usage: gham set <name> [<key> <value>]   keys: name email ssh-key host login"
   need "$1"; local name="$1"; shift
@@ -446,7 +624,10 @@ cmd_remove() {
   fi
   find "$dir" -mindepth 1 -maxdepth 2 -type l -delete
   rm -rf -- "$dir"
-  if [[ -f "$BINDS_FILE" ]]; then awk -F'\t' -v n="$name" '$2 != n' "$BINDS_FILE" > "$BINDS_FILE.tmp" && mv "$BINDS_FILE.tmp" "$BINDS_FILE"; fi
+  local f
+  for f in "$BINDS_FILE" "$OWNERS_FILE"; do
+    if [[ -f "$f" ]]; then awk -F'\t' -v n="$name" '$2 != n' "$f" > "$f.tmp" && mv "$f.tmp" "$f"; fi
+  done
   [[ "$(default_account)" == "$name" ]] && rm -f "$DEFAULT_FILE" && info "'$name' was the default; set a new one with: gham default <name>"
   info "Removed '$name'. A key gham uploaded stays on GitHub until you delete it at https://$C_host/settings/keys"
 }
@@ -458,7 +639,10 @@ cmd_rename() {
   link_shared "$(acct_dir "$2")"
   load_conf "$2"
   if [[ "$C_ssh_key" == "$(acct_dir "$1")/"* ]]; then C_ssh_key="$(acct_dir "$2")/${C_ssh_key#"$(acct_dir "$1")/"}"; save_conf "$2"; fi
-  if [[ -f "$BINDS_FILE" ]]; then awk -F'\t' -v o="$1" -v n="$2" 'BEGIN{OFS="\t"} $2 == o {$2 = n} {print}' "$BINDS_FILE" > "$BINDS_FILE.tmp" && mv "$BINDS_FILE.tmp" "$BINDS_FILE"; fi
+  local f
+  for f in "$BINDS_FILE" "$OWNERS_FILE"; do
+    if [[ -f "$f" ]]; then awk -F'\t' -v o="$1" -v n="$2" 'BEGIN{OFS="\t"} $2 == o {$2 = n} {print}' "$f" > "$f.tmp" && mv "$f.tmp" "$f"; fi
+  done
   [[ "$(default_account)" == "$1" ]] && printf '%s\n' "$2" > "$DEFAULT_FILE"
   info "Renamed '$1' → '$2'."
 }
@@ -500,7 +684,8 @@ cmd_doctor() {
   echo "git shim      $([[ "$(command -v git)" == "$GHAM_BIN/git" ]] && echo "on PATH" || echo "no — $(command -v git || echo none) wins; add: eval \"\$(gham init)\"")"
   echo "gh shim       $([[ "$(command -v gh)" == "$GHAM_BIN/gh" ]] && echo "on PATH" || echo "no — $(command -v gh || echo none) wins; add: eval \"\$(gham init)\"")"
   echo "shell init    $([[ -n "${GHAM_SHELL_INIT:-}" ]] && echo loaded || echo "not loaded")"
-  if resolve; then echo "resolves to   $R_NAME ($R_WHY)"; else echo "resolves to   nothing (git and gh pass straight through)"; fi
+  if resolve "$PWD" git; then echo "git here      $R_NAME ($R_WHY)"; else echo "git here      nothing (passes straight through)"; fi
+  if resolve "$PWD" gh; then echo "gh here       $R_NAME ($R_WHY)"; else echo "gh here       nothing (passes straight through)"; fi
   if [[ "$g" != none ]]; then
     local v; v="$("$g" --version | awk '{print $3}')"
     [[ "$(printf '%s\n2.31.0\n' "$v" | sort -V | head -1)" == 2.31.0 ]] || echo "WARNING       git $v is older than 2.31, which ignores GIT_CONFIG_COUNT: identity switching will not work"
@@ -511,6 +696,7 @@ cmd_doctor() {
   cmd_list
   echo
   cmd_binds
+  cmd_owners
 }
 
 cmd_init() {
@@ -531,7 +717,7 @@ EOF
   if [[ "$shell" == zsh ]]; then completion_zsh; else completion_bash; fi
 }
 
-GHAM_COMMANDS="add login list ls use default current run env bind unbind binds set rename mv remove rm verify doctor init version help"
+GHAM_COMMANDS="add login list ls use default current run env bind unbind binds owner unowner owners set rename mv remove rm verify doctor init version help"
 
 completion_bash() {
   cat <<EOF
@@ -547,6 +733,8 @@ _gham_complete() {
       remove|rm) w="\$(command gham list --names 2>/dev/null) -y --yes" ;;
       bind) if ((i == 2)); then COMPREPLY=(\$(compgen -d -- "\$cur")); return; fi; ((i == 3)) && w="\$(command gham list --names 2>/dev/null)" ;;
       unbind) ((i == 2)) && w="\$(cut -f1 "\$GHAM_HOME/binds" 2>/dev/null)" ;;
+      owner) ((i == 3)) && w="\$(command gham list --names 2>/dev/null)"; ((i > 3)) && w="--hostname" ;;
+      unowner) ((i == 2)) && w="\$(cut -f1 "\$GHAM_HOME/owners" 2>/dev/null | sed 's|^github.com/||')" ;;
       add) w="--import --no-login --no-ssh --ssh-key --hostname --git-name --git-email" ;;
       list|ls) ((i == 2)) && w="--names" ;;
       init) ((i == 2)) && w="zsh bash" ;;
@@ -568,6 +756,8 @@ _gham() {
     'current:which account git and gh use here' 'run:run a command as an account'
     'env:print the exports for scripts' 'bind:bind a directory to an account'
     'unbind:remove a directory bind' 'binds:list directory binds'
+    'owner:use an account for git in every repo of a GitHub owner'
+    'unowner:remove an owner bind' 'owners:list owner binds'
     'set:show or change an account'"'"'s settings' 'rename:rename an account'
     'remove:delete an account' 'verify:check the token and SSH key against GitHub'
     'doctor:check the setup' 'init:print shell integration'
@@ -582,6 +772,8 @@ _gham() {
     remove|rm) compadd -a names; compadd -- -y --yes ;;
     bind) (( CURRENT == 3 )) && _directories; (( CURRENT == 4 )) && compadd -a names ;;
     unbind) (( CURRENT == 3 )) && compadd -- ${(f)"$(cut -f1 "$GHAM_HOME/binds" 2>/dev/null)"} ;;
+    owner) (( CURRENT == 4 )) && compadd -a names; (( CURRENT > 4 )) && compadd -- --hostname ;;
+    unowner) (( CURRENT == 3 )) && compadd -- ${(f)"$(cut -f1 "$GHAM_HOME/owners" 2>/dev/null | sed 's|^github.com/||')"} ;;
     add) compadd -- --import --no-login --no-ssh --ssh-key --hostname --git-name --git-email ;;
     list|ls) (( CURRENT == 3 )) && compadd -- --names ;;
     init) (( CURRENT == 3 )) && compadd -- zsh bash ;;
@@ -608,6 +800,8 @@ gham — GitHub Account Manager
   gham use <name>              switch this shell to <name>  (gham use --default to clear)
   gham bind <dir> <name>       use <name> for git and gh anywhere under <dir>
   gham unbind <dir>            remove a bind;  gham binds  lists them
+  gham owner <owner> <name>    use <name> for git in any repo whose remote is <owner>/* (e.g. gham owner tiket work)
+  gham unowner <owner>         remove an owner bind;  gham owners  lists them
   gham default [name]          show or set the machine-wide default
   gham current [dir]           which account git and gh use here, and why
   gham run <name> [cmd…]       run a command (or a shell) as <name>, overriding binds
@@ -620,24 +814,12 @@ gham — GitHub Account Manager
   gham init [zsh|bash]         shell integration — add to your rc:  eval "$(gham init)"
   gham version                 print the gham version
 
-Order: gham run > gham use > the longest gham bind > the default.
+Order: gham run > gham use > owner of the repo's remote (git only) > the longest gham bind > the default.
 EOF
 }
 
 # --------------------------------------------------------------- dispatch
 
-case "${0##*/}" in
-  git)
-    git_workdir "$@"
-    if resolve "$W_DIR"; then apply_env "$R_NAME"; fi
-    exec "$(real_git)" "$@" ;;
-  gh)
-    if resolve; then
-      apply_env "$R_NAME"
-      [[ -L "$GH_CONFIG_DIR/config.yml" ]] || link_shared "$ACCOUNTS/$R_NAME"
-    fi
-    exec "$(real_gh)" "$@" ;;
-esac
 
 mkdir -p "$ACCOUNTS"
 cmd="${1:-help}"; shift || true
@@ -653,6 +835,9 @@ case "$cmd" in
   bind) cmd_bind "$@" ;;
   unbind) cmd_unbind "$@" ;;
   binds) cmd_binds ;;
+  owner) cmd_owner "$@" ;;
+  unowner) cmd_unowner "$@" ;;
+  owners) cmd_owners ;;
   set) cmd_set "$@" ;;
   remove|rm) cmd_remove "$@" ;;
   rename|mv) cmd_rename "$@" ;;

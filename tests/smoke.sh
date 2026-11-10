@@ -136,6 +136,43 @@ envout="$(cd "$SANDBOX/oss" && gham env work)"
 check "env exports GH_CONFIG_DIR" contains "$envout" "GH_CONFIG_DIR=$w/gh"
 check "env exports the git identity" [ "$(cd "$SANDBOX/oss" && eval "$envout" && command "$(gham doctor | awk '/^real git/ {print $3}')" config user.email)" = 42+octo-work@users.noreply.github.com ]
 
+# Owner binds: a personal repo inside a work-bound tree, holding bare repos
+# and worktrees of the work org — git follows each repository's remote.
+hub="$SANDBOX/work/hub"
+mkdir -p "$hub/.repos" "$hub/services"
+(cd "$hub" && command git init -q && command git remote add origin git@github.com:cymon1997/HUB.git)
+command git init -q "$SANDBOX/seed" && command git -C "$SANDBOX/seed" -c user.email=s@x -c user.name=s commit -q --allow-empty -m seed
+command git clone -q --bare "$SANDBOX/seed" "$hub/.repos/TIX-X.git"
+command git -C "$hub/.repos/TIX-X.git" remote set-url origin https://github.com/tiket/TIX-X.git
+command git -C "$hub/.repos/TIX-X.git" worktree add -q "$hub/services/TIX-X" HEAD 2>/dev/null
+gham owner cymon1997 personal 2>/dev/null
+gham owner Tiket work 2>/dev/null
+check "owner keys are host/owner, lowercase" grep -q "^github.com/tiket"$'\t'"work" "$GHAM_HOME/owners"
+check "owner beats the directory bind" [ "$(email_in "$hub")" = me@example.com ]
+check "owner applies in a subdirectory" bash -c "cd '$hub/services' && [ \"\$(git config user.email)\" = me@example.com ]"
+check "bare repo resolves by its remote" [ "$(cd "$hub" && git -C .repos/TIX-X.git config user.email)" = 42+octo-work@users.noreply.github.com ]
+check "linked worktree resolves by its remote" [ "$(email_in "$hub/services/TIX-X")" = 42+octo-work@users.noreply.github.com ]
+check "owner works outside any bind" [ "$(cd "$SANDBOX/oss" && git -C "$hub/.repos/TIX-X.git" config user.email)" = 42+octo-work@users.noreply.github.com ]
+check "gh still follows the directory bind" contains "$(cd "$hub" && gh repo list)" "config=$w/gh"
+cur="$(cd "$hub" && gham current)"
+check "current names the owner for git" contains "$cur" "owner github.com/cymon1997"
+check "current shows gh separately when it differs" contains "$cur" "gh here: work"
+check "gham run beats the owner" [ "$(cd "$hub" && gham run work git config user.email)" = 42+octo-work@users.noreply.github.com ]
+(cd "$hub" && command git remote set-url origin git@github.com:someone-else/HUB.git)
+check "an unbound owner falls back to the bind" [ "$(email_in "$hub")" = 42+octo-work@users.noreply.github.com ]
+(cd "$hub" && command git remote set-url origin ssh://git@github.com:22/CYMON1997/HUB)
+check "ssh:// URLs with a port match" [ "$(email_in "$hub")" = me@example.com ]
+
+# git clone has no repository yet: the URL decides. A fake ssh records the key.
+printf '#!/usr/bin/env bash\necho "$*" > "%s/ssh-args"; exit 1\n' "$SANDBOX" > "$SANDBOX/fakebin/ssh"; chmod +x "$SANDBOX/fakebin/ssh"
+(cd "$SANDBOX/oss" && git clone -q --bare git@github.com:tiket/TIX-Y.git y.git >/dev/null 2>&1 || true)
+check "clone resolves by the URL's owner" grep -q "$w/ssh/id_ed25519" "$SANDBOX/ssh-args"
+rm -f "$SANDBOX/fakebin/ssh"
+check "list counts owners" contains "$(gham list)" "1 owner"
+check "owners lists the binds" contains "$(gham owners)" "github.com/cymon1997/\*"
+gham unowner cymon1997 2>/dev/null
+check "unowner removes it" bash -c "! grep -q cymon1997 '$GHAM_HOME/owners'"
+
 # set, rename, remove.
 gham set work email work@company.example 2>/dev/null
 check "set changes the email" [ "$(email_in "$SANDBOX/work")" = work@company.example ]
@@ -143,10 +180,12 @@ check "set shows the settings" contains "$(gham set work)" "ssh-key"
 gham rename work job 2>/dev/null
 check "rename carries the bind" [ "$(email_in "$SANDBOX/work")" = work@company.example ]
 check "rename moves the SSH key path" contains "$(gham set job)" "accounts/job/ssh/id_ed25519"
+check "rename carries the owner bind" grep -q "^github.com/tiket"$'\t'"job" "$GHAM_HOME/owners"
 gham default job 2>/dev/null
 gham remove job -y 2>/dev/null
 check "remove deletes the account" [ ! -d "$GHAM_HOME/accounts/job" ]
 check "remove drops its binds" bash -c "! grep -q job '$GHAM_HOME/binds'"
+check "remove drops its owner binds" bash -c "! grep -q job '$GHAM_HOME/owners'"
 check "remove clears the default" bash -c "! gham default 2>/dev/null"
 check "shared gh config survives remove" [ -f "$HOME/.config/gh/config.yml" ]
 
