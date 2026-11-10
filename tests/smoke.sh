@@ -143,17 +143,17 @@ hub="$SANDBOX/work/hub"
 mkdir -p "$hub/.repos" "$hub/services"
 (cd "$hub" && command git init -q && command git remote add origin git@github.com:cymon1997/HUB.git)
 command git init -q "$SANDBOX/seed" && command git -C "$SANDBOX/seed" -c user.email=s@x -c user.name=s commit -q --allow-empty -m seed
-command git clone -q --bare "$SANDBOX/seed" "$hub/.repos/TIX-X.git"
-command git -C "$hub/.repos/TIX-X.git" remote set-url origin https://github.com/tiket/TIX-X.git
-command git -C "$hub/.repos/TIX-X.git" worktree add -q "$hub/services/TIX-X" HEAD 2>/dev/null
+command git clone -q --bare "$SANDBOX/seed" "$hub/.repos/api.git"
+command git -C "$hub/.repos/api.git" remote set-url origin https://github.com/acme/api.git
+command git -C "$hub/.repos/api.git" worktree add -q "$hub/services/api" HEAD 2>/dev/null
 gham owner cymon1997 personal 2>/dev/null
-gham owner Tiket work 2>/dev/null
-check "owner keys are host/owner, lowercase" grep -q "^github.com/tiket"$'\t'"work" "$GHAM_HOME/owners"
+gham owner Acme work 2>/dev/null
+check "owner keys are host/owner, lowercase" grep -q "^github.com/acme"$'\t'"work" "$GHAM_HOME/owners"
 check "owner beats the directory bind" [ "$(email_in "$hub")" = me@example.com ]
 check "owner applies in a subdirectory" bash -c "cd '$hub/services' && [ \"\$(git config user.email)\" = me@example.com ]"
-check "bare repo resolves by its remote" [ "$(cd "$hub" && git -C .repos/TIX-X.git config user.email)" = 42+octo-work@users.noreply.github.com ]
-check "linked worktree resolves by its remote" [ "$(email_in "$hub/services/TIX-X")" = 42+octo-work@users.noreply.github.com ]
-check "owner works outside any bind" [ "$(cd "$SANDBOX/oss" && git -C "$hub/.repos/TIX-X.git" config user.email)" = 42+octo-work@users.noreply.github.com ]
+check "bare repo resolves by its remote" [ "$(cd "$hub" && git -C .repos/api.git config user.email)" = 42+octo-work@users.noreply.github.com ]
+check "linked worktree resolves by its remote" [ "$(email_in "$hub/services/api")" = 42+octo-work@users.noreply.github.com ]
+check "owner works outside any bind" [ "$(cd "$SANDBOX/oss" && git -C "$hub/.repos/api.git" config user.email)" = 42+octo-work@users.noreply.github.com ]
 check "gh still follows the directory bind" contains "$(cd "$hub" && gh repo list)" "config=$w/gh"
 cur="$(cd "$hub" && gham current)"
 check "current names the owner for git" contains "$cur" "owner github.com/cymon1997"
@@ -166,7 +166,7 @@ check "ssh:// URLs with a port match" [ "$(email_in "$hub")" = me@example.com ]
 
 # git clone has no repository yet: the URL decides. A fake ssh records the key.
 printf '#!/usr/bin/env bash\necho "$*" > "%s/ssh-args"; exit 1\n' "$SANDBOX" > "$SANDBOX/fakebin/ssh"; chmod +x "$SANDBOX/fakebin/ssh"
-(cd "$SANDBOX/oss" && git clone -q --bare git@github.com:tiket/TIX-Y.git y.git >/dev/null 2>&1 || true)
+(cd "$SANDBOX/oss" && git clone -q --bare git@github.com:acme/web.git y.git >/dev/null 2>&1 || true)
 check "clone resolves by the URL's owner" grep -q "$w/ssh/id_ed25519" "$SANDBOX/ssh-args"
 rm -f "$SANDBOX/fakebin/ssh"
 check "list counts owners" contains "$(gham list)" "1 owner"
@@ -181,7 +181,7 @@ check "set shows the settings" contains "$(gham set work)" "ssh-key"
 gham rename work job 2>/dev/null
 check "rename carries the bind" [ "$(email_in "$SANDBOX/work")" = work@company.example ]
 check "rename moves the SSH key path" contains "$(gham set job)" "accounts/job/ssh/id_ed25519"
-check "rename carries the owner bind" grep -q "^github.com/tiket"$'\t'"job" "$GHAM_HOME/owners"
+check "rename carries the owner bind" grep -q "^github.com/acme"$'\t'"job" "$GHAM_HOME/owners"
 gham default job 2>/dev/null
 gham remove job -y 2>/dev/null
 check "remove deletes the account" [ ! -d "$GHAM_HOME/accounts/job" ]

@@ -24,8 +24,8 @@ $ gh pr create             # opened by me-at-work
   used for push and pull, and the HTTPS credential. Switching an account switches all four.
 - **Bind directories.** `gham bind ~/Code/company work` makes every repo under that directory
   use `work`. The deepest bind wins.
-- **Or let the repository decide.** `gham owner tiket work` makes git use `work` in any repo whose
-  remote is `tiket/*`, wherever it lives on disk. That covers a personal repo sitting inside a
+- **Or let the repository decide.** `gham owner acme work` makes git use `work` in any repo whose
+  remote is `acme/*`, wherever it lives on disk. That covers a personal repo sitting inside a
   company tree, and bare repos or worktrees of company repos inside a personal one.
 - **Override when you need to.** `gham run personal git push` does it once. `gham use personal`
   switches the shell. Both beat a bind.
