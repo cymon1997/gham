@@ -239,6 +239,12 @@ git push && gh release create v1.0.0
 - **Tools that bypass `PATH` bypass gham.** An IDE configured with `/usr/bin/git` or a GUI client
   with its own git won't see the account. Point the IDE at `~/.gham/bin/git`, or launch it from a
   `gham run` shell.
+- **gh tokens live in each account's `gh/hosts.yml`, not the system keyring.** gh keeps the
+  active account's token in one keyring entry per host, and every config directory shares it, so
+  the last login would silently become every account's token. gham logs in with
+  `--insecure-storage`, so the token is a plain-text file readable only by you, as with cam's stored
+  login. `gham doctor` flags an account whose token is still in the keyring, and `gham login <name>`
+  moves it.
 - **`GH_TOKEN`, `GITHUB_TOKEN` and `GIT_SSH_COMMAND` beat gham.** `gham doctor` warns about them.
 - **Removing an account doesn't revoke anything on GitHub.** Delete the uploaded key at
   `github.com/settings/keys` and revoke the token at `github.com/settings/applications`.

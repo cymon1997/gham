@@ -83,6 +83,7 @@ FAKE_LOGIN=octo-work gham add work 2>/dev/null
 w="$GHAM_HOME/accounts/work"
 check "add logs in through gh" grep -q 'user: octo-work' "$w/gh/hosts.yml"
 check "add asks for the key-upload scope" grep -q 'admin:public_key' "$w/gh/login-args"
+check "add keeps the token in the account, not the shared keyring" grep -q -- '--insecure-storage' "$w/gh/login-args"
 check "add fills the login from the API" grep -q '^login=octo-work' "$w/account.conf"
 check "add uses the noreply email when none is public" grep -q '^email=42+octo-work@users.noreply.github.com' "$w/account.conf"
 check "add generates an SSH key" [ -f "$w/ssh/id_ed25519" ]

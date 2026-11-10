@@ -19,6 +19,12 @@ All notable changes to gham are recorded here. The format follows
   which halves their overhead per call.
 - `rename` and `remove` keep owner binds in step.
 
+### Fixed
+- Two accounts on the same host shared one gh token: gh keeps the active token in a single
+  keyring entry per host, shared by every `GH_CONFIG_DIR`, so the last login won. `add` and `login`
+  now pass `--insecure-storage`, so each token lives in the account's own `hosts.yml` (mode 600).
+  `login` first drops a keyring copy, and `doctor` warns about accounts still using the keyring.
+
 ## [0.1.0] — 2026-11-10
 
 ### Added

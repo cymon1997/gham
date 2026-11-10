@@ -291,6 +291,12 @@ link_shared() {
   ln -s "$GH_SHARED/config.yml" "$dir/config.yml"
 }
 
+# gh keeps the active account's token in one keyring entry per host, shared by
+# every GH_CONFIG_DIR, so the last login would win for all accounts. gham
+# therefore keeps each token in the account's own hosts.yml (mode 600).
+GH_STORAGE=(--insecure-storage)
+token_in_file() { [[ -f "$ACCOUNTS/$1/gh/hosts.yml" ]] && grep -qE '^[[:space:]]+oauth_token:' "$ACCOUNTS/$1/gh/hosts.yml"; }
+
 logged_in() { [[ -f "$ACCOUNTS/$1/gh/hosts.yml" ]] && grep -qE '^[[:space:]]+user:[[:space:]]*[^[:space:]]' "$ACCOUNTS/$1/gh/hosts.yml"; }
 
 # The user gh recorded for this account's host, from hosts.yml.
@@ -397,13 +403,15 @@ cmd_add() {
     save_conf "$name"
     info "Imported the current identity into '$name'${C_login:+ (gh: $C_login)}: ${C_name:-?} <${C_email:-?}>."
     logged_in "$name" || info "No gh login was found in $GH_SHARED/hosts.yml — run: gham login $name"
+    if logged_in "$name" && ! token_in_file "$name"; then info "The imported gh token lives in the system keyring, which every account shares. Move it into '$name' with: gham login $name"; fi
     [[ -n "$C_ssh_key" ]] || info "No SSH key set, so git uses your normal ~/.ssh setup. Pin one with: gham set $name ssh-key <path>"
   elif ((login)); then
     save_conf "$name"
     info "Starting GitHub login for '$name' on $C_host …"
     local -a scopes=()
     [[ "$ssh" == gen ]] && scopes=(-s admin:public_key)
-    if GH_CONFIG_DIR="$dir/gh" "$(real_gh)" auth login -h "$C_host" -p https ${scopes[@]+"${scopes[@]}"} ${ghargs[@]+"${ghargs[@]}"}; then
+    if GH_CONFIG_DIR="$dir/gh" "$(real_gh)" auth login -h "$C_host" -p https "${GH_STORAGE[@]}" ${scopes[@]+"${scopes[@]}"} ${ghargs[@]+"${ghargs[@]}"}; then
+      chmod 600 "$dir/gh/hosts.yml" 2>/dev/null || true
       fill_from_api "$name" || C_login="$(hosts_user "$name" "$C_host")"
       [[ "$ssh" == gen ]] && make_ssh_key "$name"
       save_conf "$name"
@@ -424,7 +432,12 @@ cmd_login() {
   need "$1"; local name="$1"; shift
   link_shared "$(acct_dir "$name")"; load_conf "$name"
   local gh; gh="$(real_gh)"
-  GH_CONFIG_DIR="$(acct_dir "$name")/gh" "$gh" auth login -h "$C_host" -p https "$@"
+  # A token left in the shared keyring would shadow the file one: drop it first.
+  if logged_in "$name" && ! token_in_file "$name"; then
+    GH_CONFIG_DIR="$(acct_dir "$name")/gh" "$gh" auth logout -h "$C_host" ${C_login:+-u "$C_login"} >/dev/null 2>&1 || true
+  fi
+  GH_CONFIG_DIR="$(acct_dir "$name")/gh" "$gh" auth login -h "$C_host" -p https "${GH_STORAGE[@]}" "$@"
+  chmod 600 "$(acct_dir "$name")/gh/hosts.yml" 2>/dev/null || true
   [[ -n "$C_ssh_key" ]] && { GH_CONFIG_DIR="$(acct_dir "$name")/gh" "$gh" config set -h "$C_host" git_protocol ssh >/dev/null 2>&1 || true; }
   fill_from_api "$name" || C_login="$(hosts_user "$name" "$C_host")"
   save_conf "$name"
@@ -629,7 +642,8 @@ cmd_remove() {
     if [[ -f "$f" ]]; then awk -F'\t' -v n="$name" '$2 != n' "$f" > "$f.tmp" && mv "$f.tmp" "$f"; fi
   done
   [[ "$(default_account)" == "$name" ]] && rm -f "$DEFAULT_FILE" && info "'$name' was the default; set a new one with: gham default <name>"
-  info "Removed '$name'. A key gham uploaded stays on GitHub until you delete it at https://$C_host/settings/keys"
+  info "Removed '$name'."
+  if [[ "$C_ssh_key" == "$dir/"* ]]; then info "The SSH key gham uploaded stays on GitHub until you delete it at https://$C_host/settings/keys"; fi
 }
 
 cmd_rename() {
@@ -692,6 +706,11 @@ cmd_doctor() {
   fi
   [[ -n "${GH_TOKEN:-}${GITHUB_TOKEN:-}" ]] && echo "WARNING       GH_TOKEN / GITHUB_TOKEN is set: gh uses it for every account"
   [[ -n "${GIT_SSH_COMMAND:-}" ]] && echo "WARNING       GIT_SSH_COMMAND is set: it overrides each account's SSH key"
+  local a
+  while IFS= read -r a; do
+    [[ -n "$a" ]] && logged_in "$a" && ! token_in_file "$a" && \
+      echo "WARNING       '$a' keeps its gh token in the shared keyring, where another account's login can replace it. Fix: gham login $a"
+  done < <(account_names)
   echo
   cmd_list
   echo
