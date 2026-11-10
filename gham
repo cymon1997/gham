@@ -548,7 +548,7 @@ cmd_bind() {
 cmd_unbind() {
   [[ $# -eq 1 ]] || die "usage: gham unbind <dir>"
   local d; if [[ -d "$1" ]]; then d="$(cd "$1" && pwd -P)"; else d="${1%/}"; fi
-  [[ -f "$BINDS_FILE" ]] && awk -F'\t' -v d="$d" '$1 == d {f = 1} END {exit !f}' "$BINDS_FILE" || die "unbind: $d is not bound"
+  if ! [[ -f "$BINDS_FILE" ]] || ! awk -F'\t' -v d="$d" '$1 == d {f = 1} END {exit !f}' "$BINDS_FILE"; then die "unbind: $d is not bound"; fi
   awk -F'\t' -v d="$d" '$1 != d' "$BINDS_FILE" > "$BINDS_FILE.tmp" && mv "$BINDS_FILE.tmp" "$BINDS_FILE"
   info "Unbound $d"
 }
@@ -589,7 +589,7 @@ cmd_unowner() {
   [[ $# -ge 1 ]] || die "usage: gham unowner <owner> [--hostname H]"
   local host=""; [[ "${2:-}" == --hostname ]] && host="${3:-}"
   local k; k="$(owner_key "$1" "$host")"
-  [[ -f "$OWNERS_FILE" ]] && awk -F'\t' -v k="$k" '$1 == k {f = 1} END {exit !f}' "$OWNERS_FILE" || die "unowner: $k is not bound"
+  if ! [[ -f "$OWNERS_FILE" ]] || ! awk -F'\t' -v k="$k" '$1 == k {f = 1} END {exit !f}' "$OWNERS_FILE"; then die "unowner: $k is not bound"; fi
   awk -F'\t' -v k="$k" '$1 != k' "$OWNERS_FILE" > "$OWNERS_FILE.tmp" && mv "$OWNERS_FILE.tmp" "$OWNERS_FILE"
   info "Unbound owner $k"
 }

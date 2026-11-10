@@ -4,7 +4,8 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-SANDBOX="$(mktemp -d)"
+# Physical path: on macOS mktemp returns /var/…, a symlink to /private/var/….
+SANDBOX="$(cd "$(mktemp -d)" && pwd -P)"
 trap 'rm -rf "$SANDBOX"' EXIT
 
 export HOME="$SANDBOX/home"
@@ -129,7 +130,7 @@ check "nested shims do not stack config" [ "$(gham run work git -c alias.e='!git
 # A real commit gets the right author, and ~/.gitconfig is never touched.
 (cd "$SANDBOX/work/repo" && git init -q && git commit -q --allow-empty -m test)
 check "a commit is authored by the bound account" [ "$(cd "$SANDBOX/work/repo" && git log -1 --format=%ae)" = 42+octo-work@users.noreply.github.com ]
-check "~/.gitconfig keeps the global identity" grep -q 'email = me@example.com' "$HOME/.gitconfig"
+check "the global gitconfig keeps its identity" grep -q 'email = me@example.com' "$HOME/.gitconfig"
 check "a repo-local identity is overridden by the account" bash -c "cd '$SANDBOX/work/repo' && command '$GHAM_HOME/bin/git' config user.email local@example.com && [ \"\$(git config user.email)\" = 42+octo-work@users.noreply.github.com ]"
 
 # env for scripts.
