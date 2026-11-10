@@ -669,7 +669,14 @@ cmd_verify() {
   local ok=0 who
   if who="$(GH_CONFIG_DIR="$(acct_dir "$name")/gh" "$(real_gh)" api --hostname "$C_host" user --jq .login 2>/dev/null)"; then
     echo "gh token   ok — $who"
-    [[ -z "$C_login" || "$who" == "$C_login" ]] || { echo "           but account.conf says '$C_login'"; ok=1; }
+    if [[ -n "$C_login" && "$who" != "$C_login" ]]; then
+      echo "           but account.conf says '$C_login'"
+      if ! token_in_file "$name"; then
+        echo "           its token is in the shared system keyring, so another account's login replaced it."
+      fi
+      echo "           Fix: gham login $name   (sign in to GitHub as '$C_login' when the browser opens)"
+      ok=1
+    fi
   else
     echo "gh token   FAILED — run: gham login $name"; ok=1
   fi

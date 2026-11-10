@@ -24,6 +24,7 @@ All notable changes to gham are recorded here. The format follows
   keyring entry per host, shared by every `GH_CONFIG_DIR`, so the last login won. `add` and `login`
   now pass `--insecure-storage`, so each token lives in the account's own `hosts.yml` (mode 600).
   `login` first drops a keyring copy, and `doctor` warns about accounts still using the keyring.
+  `verify` names the cause when the token belongs to someone else and prints the `gham login` fix.
 
 ## [0.1.0] — 2026-11-10
 
