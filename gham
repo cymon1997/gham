@@ -44,6 +44,9 @@ valid_name() { [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || die "invalid accoun
 acct_dir()   { printf '%s/%s' "$ACCOUNTS" "$1"; }
 exists()     { [[ -d "$ACCOUNTS/$1" ]]; }
 need()       { valid_name "$1"; exists "$1" || die "no such account '$1' — see 'gham list'"; }
+# Lowercase $1 into LC. ${x,,} needs bash 4 and macOS ships 3.2, so use tr,
+# but only when there is an uppercase letter: the git shim stays fork-free.
+lower() { LC="$1"; if [[ "$LC" == *[[:upper:]]* ]]; then LC="$(tr '[:upper:]' '[:lower:]' <<<"$LC")"; fi; }
 default_account() { if [[ -s "$DEFAULT_FILE" ]]; then local d; read -r d < "$DEFAULT_FILE" || true; printf '%s' "$d"; fi; }
 
 # ------------------------------------------------------------ account.conf
@@ -132,7 +135,7 @@ url_owner() {
   fi
   rest="${rest#/}"; rest="${rest%%/*}"
   [[ -n "$host" && -n "$rest" ]] || return 1
-  U_KEY="${host,,}/${rest,,}"
+  lower "$host/$rest"; U_KEY="$LC"
 }
 
 # The config file of the repository containing directory $1 into G_CONFIG:
@@ -560,9 +563,10 @@ cmd_binds() {
 
 # Owner keys are "host/owner", lowercase; a bare owner means github.com.
 owner_key() {
-  local o="${1,,}" host="${2:-github.com}"
-  o="${o#https://}"; o="${o%/}"
-  [[ "$o" == */* ]] || o="${host,,}/$o"
+  local o host="${2:-github.com}"
+  lower "$1"; o="${LC#https://}"; o="${o%/}"
+  [[ "$o" == */* ]] || o="$host/$o"
+  lower "$o"; o="$LC"
   [[ "$o" =~ ^[a-z0-9.-]+/[a-z0-9._-]+$ ]] || die "owner: '$1' is not an owner name (e.g. acme, or ghe.example.com/team)"
   printf '%s' "$o"
 }
