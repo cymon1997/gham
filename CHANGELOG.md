@@ -4,6 +4,16 @@ All notable changes to gham are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+- `gham owner` failed with `${1,,}: bad substitution` under bash 3.2, the `/bin/bash` macOS ships,
+  so no owner bind could be added, and resolving a remote's owner hit the same error. Lowercasing
+  now goes through a `lower` helper that works on bash 3.2 and later, and forks `tr` only when the
+  text has an uppercase letter, so the git shim stays fork-free in the usual case.
+- CI runs the macOS smoke tests under `/bin/bash` 3.2 as well as Homebrew's bash 5, so a bash 4+
+  construct can no longer pass CI and break on a stock Mac.
+
 ## [0.2.0] — 2026-11-10
 
 ### Added
