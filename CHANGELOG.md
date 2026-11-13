@@ -4,7 +4,7 @@ All notable changes to gham are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.2.1] — 2026-11-13
 
 ### Fixed
 - `gham owner` failed with `${1,,}: bad substitution` under bash 3.2, the `/bin/bash` macOS ships,

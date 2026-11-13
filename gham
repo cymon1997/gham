@@ -27,7 +27,7 @@
 #   `gham bind` directory containing the working directory > the default.
 set -euo pipefail
 
-GHAM_VERSION="0.2.0"
+GHAM_VERSION="0.2.1"
 GHAM_HOME="${GHAM_HOME:-$HOME/.gham}"
 ACCOUNTS="$GHAM_HOME/accounts"
 DEFAULT_FILE="$GHAM_HOME/default"
