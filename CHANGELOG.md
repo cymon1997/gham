@@ -35,8 +35,8 @@ All notable changes to gham are recorded here. The format follows
   that host and put `gh auth git-credential` in its place, though gh held no token for it.
 
 ### Docs
-- README: bash 4+ is required (macOS: `brew install bash`), and `gham init` belongs after
-  `brew shellenv` in the rc file.
+- README: `gham init` belongs after `brew shellenv` in the rc file, so the shims stay first on
+  `PATH`.
 
 ### Compatibility
 - Accounts without a `provider` line are `github` and behave exactly as in 0.2. An older gham

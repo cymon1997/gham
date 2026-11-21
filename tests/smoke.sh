@@ -294,12 +294,13 @@ check "legacy: git gets the gh credential helper" contains "$(gham run legacy gi
 check "legacy: gh gets the account's config dir" contains "$(gham run legacy gh repo list)" "config=$GHAM_HOME/accounts/legacy/gh"
 
 # ssh greetings from different hosts.
-greet() { bash -c 'source <(sed -n "/^ssh_greeting()/,/^}/p" "$1"); ssh_greeting "$2" && echo "ok:$S_USER"' _ "$GHAM_HOME/bin/gham" "$1"; }
+# eval, not `source <(…)`: bash 3.2 reads nothing from a process substitution.
+greet() { bash -c 'eval "$(sed -n "/^ssh_greeting()/,/^}/p" "$1")"; ssh_greeting "$2" && echo "ok:$S_USER"' _ "$GHAM_HOME/bin/gham" "$1"; }
 check "ssh: GitHub greeting" [ "$(greet "Hi octo! You've successfully authenticated, but GitHub does not provide shell access.")" = ok:octo ]
 check "ssh: GitLab greeting" [ "$(greet "Welcome to GitLab, @tanuki!")" = ok:tanuki ]
 check "ssh: Gitea greeting" [ "$(greet "Hi there, gitea-user! You've successfully authenticated with the key named k")" = ok:gitea-user ]
 check "ssh: Bitbucket greeting" [ "$(greet "authenticated via ssh key.")" = ok: ]
-check "ssh: a refusal fails" bash -c "! (source <(sed -n '/^ssh_greeting()/,/^}/p' '$GHAM_HOME/bin/gham'); ssh_greeting 'git@x: Permission denied (publickey).')"
+check "ssh: a refusal fails" [ -z "$(greet 'git@x: Permission denied (publickey).')" ]
 
 check "unknown provider fails" bash -c "! gham add z --provider svn 2>/dev/null"
 check "unknown account fails" bash -c "! gham run nope true 2>/dev/null"

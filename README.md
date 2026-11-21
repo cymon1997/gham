@@ -39,7 +39,8 @@ $ gh pr create             # opened by me-at-work
   aliases and tools that call them from `PATH` follow along.
 - **`~/.gitconfig` is never edited.** The account's settings are injected through git's own
   `GIT_CONFIG_COUNT` environment config, and `git config --global` still writes where it always did.
-- **A single bash script** with no dependencies beyond `bash` 4+, `git` 2.31+ and `ssh-keygen`.
+- **A single bash script** with no dependencies beyond `bash` (3.2 or later, so macOS's own
+  works), `git` 2.31+ and `ssh-keygen`.
   `gh` is needed only for GitHub accounts, `glab` only for GitLab accounts.
 
 ## Providers
@@ -131,10 +132,6 @@ Add this line to `~/.zshrc` or `~/.bashrc`, then open a new shell:
 ```bash
 eval "$(~/.gham/bin/gham init)"
 ```
-
-**macOS** ships bash 3.2, which gham does not run on yet: `brew install bash` first. The shims
-start with `#!/usr/bin/env bash`, so the Homebrew bash must come first on `PATH` for every program
-that runs `git`, including IDEs.
 
 **Order matters in your rc file.** Put the `gham init` line *after* anything else that changes
 `PATH`, such as `eval "$(brew shellenv)"`, so `~/.gham/bin` stays in front of Homebrew's `git`,
