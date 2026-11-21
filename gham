@@ -1,23 +1,30 @@
 #!/usr/bin/env bash
-# gham — GitHub Account Manager.
+# gham — Git Hosting Account Manager.
 #
-# Keeps several GitHub identities on one machine and picks one per directory,
-# per shell, per command, or as the machine default — the sibling of cam.
+# Keeps several git identities on one machine — GitHub, GitLab or any other
+# git host — and picks one per directory, per repository owner, per shell, per
+# command, or as the machine default. The sibling of cam.
 #
 # How it works
 #   An account is a directory under $GHAM_HOME/accounts/<name> holding:
-#     gh/            GH_CONFIG_DIR for this account: its own hosts.yml (the gh
-#                    login); config.yml is a symlink to the shared gh config,
-#                    so aliases and settings are shared.
+#     account.conf   provider, login, host, git name/email and SSH key path.
+#     gh/            provider=github: GH_CONFIG_DIR, its own hosts.yml (the gh
+#                    login); config.yml links to the shared gh config.
+#     glab/          provider=gitlab: GLAB_CONFIG_DIR, its own config.yml with
+#                    the glab login.
 #     ssh/           the account's SSH key, when gham generated one.
-#     account.conf   login, host, git name/email and SSH key path.
 #
-#   $GHAM_HOME/bin/gh and $GHAM_HOME/bin/git are shims. With $GHAM_HOME/bin
-#   first on PATH they resolve an account and exec the real binary with:
-#     GH_CONFIG_DIR          the account's gh login
+#   Providers: github (gh logs in, uploads the key, serves HTTPS tokens),
+#   gitlab (the same through glab), git (any host: identity and SSH key only;
+#   HTTPS stays with your own credential helper).
+#
+#   $GHAM_HOME/bin/{git,gh,glab} are shims. With $GHAM_HOME/bin first on PATH
+#   they resolve an account and exec the real binary with:
+#     GH_CONFIG_DIR / GLAB_CONFIG_DIR   the account's CLI login
 #     GIT_CONFIG_COUNT/...   user.name, user.email, core.sshCommand (the
-#                            account's key) and a credential helper that asks
-#                            the account's gh for HTTPS tokens
+#                            account's key) and, for github and gitlab, a
+#                            credential helper that asks the account's CLI for
+#                            HTTPS tokens
 #   ~/.gitconfig itself is never edited, and `git config --global` still
 #   writes there.
 #
@@ -27,7 +34,7 @@
 #   `gham bind` directory containing the working directory > the default.
 set -euo pipefail
 
-GHAM_VERSION="0.2.1"
+GHAM_VERSION="0.3.0"
 GHAM_HOME="${GHAM_HOME:-$HOME/.gham}"
 ACCOUNTS="$GHAM_HOME/accounts"
 DEFAULT_FILE="$GHAM_HOME/default"
@@ -35,7 +42,9 @@ BINDS_FILE="$GHAM_HOME/binds"
 OWNERS_FILE="$GHAM_HOME/owners"
 GHAM_BIN="$GHAM_HOME/bin"
 GH_SHARED="${GHAM_GH_SHARED_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/gh}"
-CONF_KEYS=(login host name email ssh_key)
+GLAB_SHARED="${GHAM_GLAB_SHARED_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/glab-cli}"
+CONF_KEYS=(provider login host name email ssh_key)
+PROVIDERS="github gitlab git"
 
 die()  { printf 'gham: %s\n' "$*" >&2; exit 1; }
 info() { printf '%s\n' "$*" >&2; }
@@ -56,11 +65,24 @@ default_account() { if [[ -s "$DEFAULT_FILE" ]]; then local d; read -r d < "$DEF
 load_conf() {
   local k v f="$ACCOUNTS/$1/account.conf"
   for k in "${CONF_KEYS[@]}"; do printf -v "C_$k" '%s' ""; done
-  C_host=github.com
+  # No provider line: an account from gham 0.2 or older, which only knew GitHub.
+  C_provider=github C_host=github.com
   [[ -f "$f" ]] || return 0
   while IFS='=' read -r k v || [[ -n "$k" ]]; do
-    case "$k" in login|host|name|email|ssh_key) printf -v "C_$k" '%s' "$v" ;; esac
+    case "$k" in provider|login|host|name|email|ssh_key) printf -v "C_$k" '%s' "$v" ;; esac
   done < "$f"
+  [[ -n "$C_provider" ]] || C_provider=github
+}
+
+valid_provider() { case " $PROVIDERS " in *" $1 "*) return 0 ;; esac; die "unknown provider '$1' (github, gitlab, git)"; }
+
+# The provider a host most likely runs, when --provider is not given. Anything
+# not obviously GitLab stays github, as before (GitHub Enterprise hosts).
+guess_provider() {
+  case "$1" in
+    gitlab.com|gitlab.*) echo gitlab ;;
+    *) echo github ;;
+  esac
 }
 
 save_conf() {
@@ -90,7 +112,8 @@ find_bin() {
 }
 real_bin() { find_bin "$@" && printf '%s' "$RB"; }
 real_git() { real_bin git "${GHAM_GIT_BIN:-}" || die "cannot find the real git binary (set GHAM_GIT_BIN)"; }
-real_gh()  { real_bin gh "${GHAM_GH_BIN:-}" || die "cannot find the real gh binary (set GHAM_GH_BIN)"; }
+real_gh()  { real_bin gh "${GHAM_GH_BIN:-}" || die "this needs gh, which is not installed (or set GHAM_GH_BIN). Install it, or use --provider git"; }
+real_glab() { real_bin glab "${GHAM_GLAB_BIN:-}" || die "this needs glab, which is not installed (or set GHAM_GLAB_BIN). Install it, or use --provider git"; }
 
 # ------------------------------------------------------------ resolution
 
@@ -256,14 +279,18 @@ git_workdir() {
 _cfg_n=0
 add_cfg() { export "GIT_CONFIG_KEY_$_cfg_n=$1" "GIT_CONFIG_VALUE_$_cfg_n=$2"; _cfg_n=$((_cfg_n + 1)); }
 
-# Export everything that makes git and gh act as account $1.
+# Export everything that makes git and the account's CLI act as account $1.
 apply_env() {
   local name="$1" dir="$ACCOUNTS/$1"
   exists "$name" || die "account '$name' (from ${R_WHY:-GHAM_ACCOUNT_ACTIVE}) does not exist — see 'gham list'"
-  export GH_CONFIG_DIR="$dir/gh" GHAM_ACCOUNT_ACTIVE="$name"
+  load_conf "$name"
+  export GHAM_ACCOUNT_ACTIVE="$name"
+  case "$C_provider" in
+    github) export GH_CONFIG_DIR="$dir/gh" ;;
+    gitlab) export GLAB_CONFIG_DIR="$dir/glab" ;;
+  esac
   # A child of an already-configured process: the overrides are inherited.
   [[ "${GHAM_ENV_APPLIED:-}" == "$name" ]] && return 0
-  load_conf "$name"
   _cfg_n="${GIT_CONFIG_COUNT:-0}"
   [[ -n "$C_name" ]] && add_cfg user.name "$C_name"
   [[ -n "$C_email" ]] && add_cfg user.email "$C_email"
@@ -271,12 +298,27 @@ apply_env() {
     local k; printf -v k '%q' "$C_ssh_key"
     add_cfg core.sshCommand "ssh -i $k -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
   fi
+  # HTTPS: github and gitlab hand git the token their CLI holds for this
+  # account. A plain git account keeps the user's own helper (keyring, GCM…)
+  # and only names the user, so a helper that stores one credential per
+  # host+user keeps several accounts on one host apart.
   local q
-  if find_bin gh "${GHAM_GH_BIN:-}"; then
-    printf -v q '%q' "$RB"
-    add_cfg "credential.https://$C_host.helper" ""
-    add_cfg "credential.https://$C_host.helper" "!$q auth git-credential"
-  fi
+  case "$C_provider" in
+    github)
+      if find_bin gh "${GHAM_GH_BIN:-}"; then
+        printf -v q '%q' "$RB"
+        add_cfg "credential.https://$C_host.helper" ""
+        add_cfg "credential.https://$C_host.helper" "!$q auth git-credential"
+      fi ;;
+    gitlab)
+      if find_bin glab "${GHAM_GLAB_BIN:-}"; then
+        printf -v q '%q' "$RB"
+        add_cfg "credential.https://$C_host.helper" ""
+        add_cfg "credential.https://$C_host.helper" "!$q auth git-credential"
+      fi ;;
+    git)
+      [[ -n "$C_login" ]] && add_cfg "credential.https://$C_host.username" "$C_login" ;;
+  esac
   export GIT_CONFIG_COUNT="$_cfg_n" GHAM_ENV_APPLIED="$name"
 }
 
@@ -294,13 +336,26 @@ link_shared() {
   ln -s "$GH_SHARED/config.yml" "$dir/config.yml"
 }
 
+# The account's CLI config directory: gh's is shared-linked, glab's is private
+# (glab keeps hosts and settings in one config.yml, so it cannot be shared).
+prepare_cli_dir() {
+  local dir; dir="$(acct_dir "$1")"
+  case "$C_provider" in
+    github) link_shared "$dir" ;;
+    gitlab) mkdir -p "$dir/glab"; chmod 700 "$dir/glab" ;;
+  esac
+}
+
 # gh keeps the active account's token in one keyring entry per host, shared by
 # every GH_CONFIG_DIR, so the last login would win for all accounts. gham
 # therefore keeps each token in the account's own hosts.yml (mode 600).
+# glab already keeps its token in config.yml unless told --use-keyring.
 GH_STORAGE=(--insecure-storage)
 token_in_file() { [[ -f "$ACCOUNTS/$1/gh/hosts.yml" ]] && grep -qE '^[[:space:]]+oauth_token:' "$ACCOUNTS/$1/gh/hosts.yml"; }
 
-logged_in() { [[ -f "$ACCOUNTS/$1/gh/hosts.yml" ]] && grep -qE '^[[:space:]]+user:[[:space:]]*[^[:space:]]' "$ACCOUNTS/$1/gh/hosts.yml"; }
+gh_logged_in()   { [[ -f "$ACCOUNTS/$1/gh/hosts.yml" ]] && grep -qE '^[[:space:]]+user:[[:space:]]*[^[:space:]]' "$ACCOUNTS/$1/gh/hosts.yml"; }
+glab_logged_in() { [[ -f "$ACCOUNTS/$1/glab/config.yml" ]] && grep -qE '^[[:space:]]+token:[[:space:]]*[^[:space:]"'"'"']' "$ACCOUNTS/$1/glab/config.yml"; }
+logged_in()      { gh_logged_in "$1" || glab_logged_in "$1"; }
 
 # The user gh recorded for this account's host, from hosts.yml.
 hosts_user() {
@@ -309,8 +364,29 @@ hosts_user() {
   awk -v h="$2:" '$0 ~ "^[^ ]" {in_h = ($1 == h)} in_h && $1 == "user:" {print $2; exit}' "$f"
 }
 
-# Fill login, name and email from the GitHub API after a login.
+# The user glab recorded for host $2 in config file $1 (hosts: → <host>: → user:).
+glab_user() {
+  [[ -f "$1" ]] || return 0
+  awk -v h="$2:" '
+    $1 == h { in_h = 1; ind = index($0, $1); next }
+    in_h && NF && index($0, $1) <= ind { in_h = 0 }
+    in_h && $1 == "user:" { gsub(/["'"'"']/, "", $2); print $2; exit }' "$1"
+}
+
+# The first "key": "string" (or number) in a JSON document, without jq.
+json_str() { local re="\"$2\"[[:space:]]*:[[:space:]]*\"([^\"]*)\""; [[ "$1" =~ $re ]] && printf '%s' "${BASH_REMATCH[1]}"; }
+json_num() { local re="\"$2\"[[:space:]]*:[[:space:]]*([0-9]+)"; [[ "$1" =~ $re ]] && printf '%s' "${BASH_REMATCH[1]}"; }
+
+# Fill login, name and email from the host's API after a login.
 fill_from_api() {
+  case "$C_provider" in
+    github) fill_from_github "$1" ;;
+    gitlab) fill_from_gitlab "$1" ;;
+    *) return 1 ;;
+  esac
+}
+
+fill_from_github() {
   local name="$1" row login id gname gemail
   row="$(GH_CONFIG_DIR="$ACCOUNTS/$name/gh" "$(real_gh)" api -H 'Accept: application/vnd.github+json' \
     --hostname "$C_host" user --jq '[.login, (.id|tostring), (.name // ""), (.email // "")] | @tsv' 2>/dev/null)" || return 1
@@ -325,7 +401,67 @@ fill_from_api() {
   fi
 }
 
-# Generate an ed25519 key for the account and upload it to GitHub.
+# GitLab's /user: the commit email the user chose in GitLab, else the public
+# one, else gitlab.com's private noreply address, else the primary email.
+fill_from_gitlab() {
+  local name="$1" row login id gname ce pe pr
+  row="$(GLAB_CONFIG_DIR="$ACCOUNTS/$name/glab" "$(real_glab)" api --hostname "$C_host" user 2>/dev/null)" || return 1
+  login="$(json_str "$row" username)" || return 1
+  id="$(json_num "$row" id || true)"; gname="$(json_str "$row" name || true)"
+  ce="$(json_str "$row" commit_email || true)"; pe="$(json_str "$row" public_email || true)"; pr="$(json_str "$row" email || true)"
+  C_login="$login"
+  [[ -n "$C_name" ]] || C_name="${gname:-$login}"
+  if [[ -z "$C_email" ]]; then
+    if [[ -n "$ce" ]]; then C_email="$ce"
+    elif [[ -n "$pe" ]]; then C_email="$pe"
+    elif [[ "$C_host" == gitlab.com && -n "$id" ]]; then C_email="$id-$login@users.noreply.gitlab.com"
+    else C_email="$pr"
+    fi
+  fi
+}
+
+# Where a person adds an SSH key by hand on this account's host, if known.
+keys_url() {
+  case "$C_provider" in
+    github) echo "https://$C_host/settings/keys" ;;
+    gitlab) echo "https://$C_host/-/user_settings/ssh_keys" ;;
+    *)
+      case "$C_host" in
+        github.com) echo "https://github.com/settings/keys" ;;
+        gitlab.com) echo "https://gitlab.com/-/user_settings/ssh_keys" ;;
+        bitbucket.org) echo "https://bitbucket.org/account/settings/ssh-keys/" ;;
+        codeberg.org) echo "https://codeberg.org/user/settings/keys" ;;
+      esac ;;
+  esac
+}
+
+# Copy stdin to the clipboard, if this machine has a clipboard tool.
+to_clipboard() {
+  if command -v pbcopy >/dev/null; then pbcopy
+  elif [[ -n "${WAYLAND_DISPLAY:-}" ]] && command -v wl-copy >/dev/null; then wl-copy
+  elif [[ -n "${DISPLAY:-}" ]] && command -v xclip >/dev/null; then xclip -selection clipboard
+  elif [[ -n "${DISPLAY:-}" ]] && command -v xsel >/dev/null; then xsel --clipboard --input
+  else cat >/dev/null; return 1
+  fi
+}
+
+# Tell the user how to add the public key themselves.
+manual_key_hint() {
+  local pub="$1" url copied=""
+  url="$(keys_url)"
+  to_clipboard < "$pub" 2>/dev/null && copied=" (copied to the clipboard)"
+  info "Add this public key to your account on $C_host$copied:"
+  info ""
+  info "  $(cat "$pub")"
+  info ""
+  if [[ -n "$url" ]]; then info "  → $url"
+  else info "  → your host's SSH key settings (Gitea/Forgejo: https://$C_host/user/settings/keys)"
+  fi
+  info "Then check it with: gham verify $2"
+}
+
+# Generate an ed25519 key for the account and upload it through the
+# provider's CLI; a plain git account gets instructions instead.
 make_ssh_key() {
   local name="$1" dir="$ACCOUNTS/$1/ssh" title
   title="gham $name ($(hostname 2>/dev/null || echo host))"
@@ -333,15 +469,44 @@ make_ssh_key() {
   mkdir -p "$dir"; chmod 700 "$dir"
   [[ -f "$dir/id_ed25519" ]] || ssh-keygen -q -t ed25519 -N "" -C "gham-$name" -f "$dir/id_ed25519"
   C_ssh_key="$dir/id_ed25519"
-  if GH_CONFIG_DIR="$ACCOUNTS/$name/gh" "$(real_gh)" ssh-key add "$dir/id_ed25519.pub" --title "$title" >/dev/null 2>&1; then
-    info "Uploaded SSH key '$title' to $C_host."
-  else
-    info "gham: could not upload the SSH key. Add $dir/id_ed25519.pub at https://$C_host/settings/keys"
-  fi
-  GH_CONFIG_DIR="$ACCOUNTS/$name/gh" "$(real_gh)" config set -h "$C_host" git_protocol ssh >/dev/null 2>&1 || true
+  case "$C_provider" in
+    github)
+      if GH_CONFIG_DIR="$ACCOUNTS/$name/gh" "$(real_gh)" ssh-key add "$dir/id_ed25519.pub" --title "$title" >/dev/null 2>&1; then
+        info "Uploaded SSH key '$title' to $C_host."
+      else
+        info "gham: could not upload the SSH key."; manual_key_hint "$dir/id_ed25519.pub" "$name"
+      fi
+      GH_CONFIG_DIR="$ACCOUNTS/$name/gh" "$(real_gh)" config set -h "$C_host" git_protocol ssh >/dev/null 2>&1 || true ;;
+    gitlab)
+      if GLAB_CONFIG_DIR="$ACCOUNTS/$name/glab" "$(real_glab)" ssh-key add "$dir/id_ed25519.pub" --title "$title" >/dev/null 2>&1; then
+        info "Uploaded SSH key '$title' to $C_host."
+      else
+        info "gham: could not upload the SSH key (the token needs the 'api' scope)."; manual_key_hint "$dir/id_ed25519.pub" "$name"
+      fi
+      GLAB_CONFIG_DIR="$ACCOUNTS/$name/glab" "$(real_glab)" config set --host "$C_host" git_protocol ssh >/dev/null 2>&1 || true ;;
+    *)
+      manual_key_hint "$dir/id_ed25519.pub" "$name" ;;
+  esac
 }
 
 # ------------------------------------------------------------ shims
+
+# gh and glab follow directory binds (no owner lookup). Each one only takes
+# over for an account of its own provider; for any other account it runs
+# untouched, with your normal login.
+shim_cli() { # shim_cli <prog> <provider> <override-bin> args…
+  local prog="$1" prov="$2" override="$3"; shift 3
+  if resolve; then
+    exists "$R_NAME" || apply_env "$R_NAME"   # dies with the "does not exist" message
+    load_conf "$R_NAME"
+    if [[ "$C_provider" == "$prov" ]]; then
+      apply_env "$R_NAME"
+      [[ "$prov" != github || -L "$GH_CONFIG_DIR/config.yml" ]] || link_shared "$ACCOUNTS/$R_NAME"
+    fi
+  fi
+  find_bin "$prog" "$override" || { printf '%s: command not found (gham shim: no real %s on PATH; set GHAM_%s_BIN)\n' "$prog" "$prog" "$(printf '%s' "$prog" | tr '[:lower:]' '[:upper:]')" >&2; exit 127; }
+  exec "$RB" "$@"
+}
 
 # Dispatched here, before the command definitions below, so a shim never
 # parses them: bash reads a script as it runs it, and exec ends the read.
@@ -351,20 +516,15 @@ case "${0##*/}" in
     if resolve "$W_DIR" git; then apply_env "$R_NAME"; fi
     find_bin git "${GHAM_GIT_BIN:-}" || die "cannot find the real git binary (set GHAM_GIT_BIN)"
     exec "$RB" "$@" ;;
-  gh)
-    if resolve; then
-      apply_env "$R_NAME"
-      [[ -L "$GH_CONFIG_DIR/config.yml" ]] || link_shared "$ACCOUNTS/$R_NAME"
-    fi
-    find_bin gh "${GHAM_GH_BIN:-}" || die "cannot find the real gh binary (set GHAM_GH_BIN)"
-    exec "$RB" "$@" ;;
+  gh) shim_cli gh github "${GHAM_GH_BIN:-}" "$@" ;;
+  glab) shim_cli glab gitlab "${GHAM_GLAB_BIN:-}" "$@" ;;
 esac
 
 # ------------------------------------------------------------ commands
 
 cmd_add() {
-  local name="" import=0 login=1 ssh=gen key="" host="" gname="" gemail=""
-  local -a ghargs=()
+  local name="" import=0 login=1 ssh=gen key="" host="" gname="" gemail="" provider="" user=""
+  local -a cliargs=()
   while (($#)); do
     case "$1" in
       --import) import=1 ;;
@@ -372,50 +532,86 @@ cmd_add() {
       --no-ssh) ssh=none ;;
       --ssh-key) shift; [[ $# -gt 0 ]] || die "add: --ssh-key needs a path"; ssh=path key="$1" ;;
       --hostname) shift; [[ $# -gt 0 ]] || die "add: --hostname needs a host"; host="$1" ;;
+      --provider) shift; [[ $# -gt 0 ]] || die "add: --provider needs github, gitlab or git"; provider="$1" ;;
+      --user) shift; [[ $# -gt 0 ]] || die "add: --user needs a username"; user="$1" ;;
       --git-name) shift; [[ $# -gt 0 ]] || die "add: --git-name needs a value"; gname="$1" ;;
       --git-email) shift; [[ $# -gt 0 ]] || die "add: --git-email needs a value"; gemail="$1" ;;
-      --) shift; ghargs=("$@"); break ;;
+      --) shift; cliargs=("$@"); break ;;
       -*) die "add: unknown option $1" ;;
       *) [[ -z "$name" ]] || die "add: one name only"; name="$1" ;;
     esac; shift
   done
-  [[ -n "$name" ]] || die "usage: gham add <name> [--import | --no-login] [--ssh-key PATH | --no-ssh] [--hostname H] [--git-name N] [--git-email E] [-- gh auth login args]"
+  [[ -n "$name" ]] || die "usage: gham add <name> [--provider github|gitlab|git] [--hostname H] [--import | --no-login] [--ssh-key PATH | --no-ssh] [--git-name N] [--git-email E] [--user U] [-- CLI login args]"
   valid_name "$name"
   exists "$name" && die "account '$name' already exists"
+  [[ -n "$provider" ]] || provider="$(guess_provider "${host:-github.com}")"
+  valid_provider "$provider"
+  if [[ -z "$host" ]]; then
+    case "$provider" in
+      github) host=github.com ;;
+      gitlab) host=gitlab.com ;;
+      git) die "add: --provider git needs --hostname (e.g. bitbucket.org, codeberg.org, git.example.com)" ;;
+    esac
+  fi
   if [[ "$ssh" == path ]]; then
     [[ -f "$key" ]] || die "add: no SSH key at $key"
     key="$(cd "$(dirname "$key")" && pwd -P)/$(basename "$key")"
   fi
+  # Fail before creating anything when the provider's CLI is missing.
+  if ((import || login)); then
+    case "$provider" in
+      github) real_gh >/dev/null ;;
+      gitlab) real_glab >/dev/null ;;
+    esac
+  fi
 
   local dir; dir="$(acct_dir "$name")"
-  mkdir -p "$dir"; chmod 700 "$dir"
-  link_shared "$dir"
   load_conf "$name"
-  [[ -n "$host" ]] && C_host="$host"
-  C_name="$gname" C_email="$gemail"
+  C_provider="$provider" C_host="$host" C_name="$gname" C_email="$gemail" C_login="$user"
   [[ "$ssh" == path ]] && C_ssh_key="$key"
+  if [[ "$provider" == git ]] && ((!import)); then
+    [[ -n "$C_email" ]] || die "add: a git account needs --git-email (or --import to take your global git identity)"
+  fi
+  mkdir -p "$dir"; chmod 700 "$dir"
+  prepare_cli_dir "$name"
 
   if ((import)); then
     local git; git="$(real_git)"
-    if [[ -f "$GH_SHARED/hosts.yml" ]]; then
-      cp "$GH_SHARED/hosts.yml" "$dir/gh/hosts.yml"; chmod 600 "$dir/gh/hosts.yml"
-      C_login="$(hosts_user "$name" "$C_host")"
-    fi
+    case "$provider" in
+      github)
+        if [[ -f "$GH_SHARED/hosts.yml" ]]; then
+          cp "$GH_SHARED/hosts.yml" "$dir/gh/hosts.yml"; chmod 600 "$dir/gh/hosts.yml"
+          [[ -n "$C_login" ]] || C_login="$(hosts_user "$name" "$C_host")"
+        fi ;;
+      gitlab)
+        if [[ -f "$GLAB_SHARED/config.yml" ]]; then
+          cp "$GLAB_SHARED/config.yml" "$dir/glab/config.yml"; chmod 600 "$dir/glab/config.yml"
+          [[ -n "$C_login" ]] || C_login="$(glab_user "$dir/glab/config.yml" "$C_host")"
+        fi ;;
+    esac
     [[ -n "$C_name" ]] || C_name="$("$git" config --global user.name 2>/dev/null || true)"
     [[ -n "$C_email" ]] || C_email="$("$git" config --global user.email 2>/dev/null || true)"
     save_conf "$name"
-    info "Imported the current identity into '$name'${C_login:+ (gh: $C_login)}: ${C_name:-?} <${C_email:-?}>."
-    logged_in "$name" || info "No gh login was found in $GH_SHARED/hosts.yml — run: gham login $name"
-    if logged_in "$name" && ! token_in_file "$name"; then info "The imported gh token lives in the system keyring, which every account shares. Move it into '$name' with: gham login $name"; fi
+    info "Imported the current identity into '$name'${C_login:+ ($provider: $C_login)}: ${C_name:-?} <${C_email:-?}>."
+    case "$provider" in
+      github)
+        gh_logged_in "$name" || info "No gh login was found in $GH_SHARED/hosts.yml — run: gham login $name"
+        if gh_logged_in "$name" && ! token_in_file "$name"; then info "The imported gh token lives in the system keyring, which every account shares. Move it into '$name' with: gham login $name"; fi ;;
+      gitlab)
+        glab_logged_in "$name" || info "No glab token was found for $C_host in $GLAB_SHARED/config.yml (a keyring login is not copied) — run: gham login $name" ;;
+    esac
     [[ -n "$C_ssh_key" ]] || info "No SSH key set, so git uses your normal ~/.ssh setup. Pin one with: gham set $name ssh-key <path>"
+  elif [[ "$provider" == git ]]; then
+    [[ -n "$C_name" ]] || C_name="$("$(real_git)" config --global user.name 2>/dev/null || true)"
+    [[ "$ssh" == gen ]] && make_ssh_key "$name"
+    save_conf "$name"
+    info "Created git account '$name' on $C_host. Commits will be authored as: ${C_name:-?} <${C_email:-?}>."
+    [[ -n "$C_ssh_key" ]] || info "No SSH key set, so git uses your normal ~/.ssh setup."
+    info "HTTPS uses your own git credential helper${C_login:+, with username $C_login}; gham does not store tokens for git accounts."
   elif ((login)); then
     save_conf "$name"
-    info "Starting GitHub login for '$name' on $C_host …"
-    local -a scopes=()
-    [[ "$ssh" == gen ]] && scopes=(-s admin:public_key)
-    if GH_CONFIG_DIR="$dir/gh" "$(real_gh)" auth login -h "$C_host" -p https "${GH_STORAGE[@]}" ${scopes[@]+"${scopes[@]}"} ${ghargs[@]+"${ghargs[@]}"}; then
-      chmod 600 "$dir/gh/hosts.yml" 2>/dev/null || true
-      fill_from_api "$name" || C_login="$(hosts_user "$name" "$C_host")"
+    if cli_login "$name" "$ssh" ${cliargs[@]+"${cliargs[@]}"}; then
+      fill_from_api "$name" || true
       [[ "$ssh" == gen ]] && make_ssh_key "$name"
       save_conf "$name"
       info "Logged in as ${C_login:-?}. Commits will be authored as: ${C_name:-?} <${C_email:-?}>."
@@ -430,19 +626,46 @@ cmd_add() {
   return 0
 }
 
+# Run the provider's browser/token login for account $1 into its own config
+# dir. $2: "gen" when gham will upload a key (gh then asks for that scope).
+cli_login() {
+  local name="$1" ssh="$2" dir; shift 2
+  dir="$(acct_dir "$name")"
+  case "$C_provider" in
+    github)
+      local -a scopes=()
+      [[ "$ssh" == gen ]] && scopes=(-s admin:public_key)
+      info "Starting GitHub login for '$name' on $C_host …"
+      GH_CONFIG_DIR="$dir/gh" "$(real_gh)" auth login -h "$C_host" -p https "${GH_STORAGE[@]}" ${scopes[@]+"${scopes[@]}"} "$@" || return 1
+      chmod 600 "$dir/gh/hosts.yml" 2>/dev/null || true
+      [[ -n "$C_login" ]] || C_login="$(hosts_user "$name" "$C_host")" ;;
+    gitlab)
+      info "Starting GitLab login for '$name' on $C_host … (a token needs the 'api' scope for the key upload)"
+      GLAB_CONFIG_DIR="$dir/glab" "$(real_glab)" auth login --hostname "$C_host" "$@" || return 1
+      chmod 600 "$dir/glab/config.yml" 2>/dev/null || true
+      [[ -n "$C_login" ]] || C_login="$(glab_user "$dir/glab/config.yml" "$C_host")" ;;
+    *) die "'$name' is a plain git account: there is nothing to log in to. HTTPS uses your git credential helper." ;;
+  esac
+}
+
 cmd_login() {
-  [[ $# -ge 1 ]] || die "usage: gham login <name> [gh auth login args…]"
+  [[ $# -ge 1 ]] || die "usage: gham login <name> [gh/glab auth login args…]"
   need "$1"; local name="$1"; shift
-  link_shared "$(acct_dir "$name")"; load_conf "$name"
-  local gh; gh="$(real_gh)"
-  # A token left in the shared keyring would shadow the file one: drop it first.
-  if logged_in "$name" && ! token_in_file "$name"; then
-    GH_CONFIG_DIR="$(acct_dir "$name")/gh" "$gh" auth logout -h "$C_host" ${C_login:+-u "$C_login"} >/dev/null 2>&1 || true
+  load_conf "$name"; prepare_cli_dir "$name"
+  if [[ "$C_provider" == github ]] && gh_logged_in "$name" && ! token_in_file "$name"; then
+    # A token left in the shared keyring would shadow the file one: drop it first.
+    GH_CONFIG_DIR="$(acct_dir "$name")/gh" "$(real_gh)" auth logout -h "$C_host" ${C_login:+-u "$C_login"} >/dev/null 2>&1 || true
   fi
-  GH_CONFIG_DIR="$(acct_dir "$name")/gh" "$gh" auth login -h "$C_host" -p https "${GH_STORAGE[@]}" "$@"
-  chmod 600 "$(acct_dir "$name")/gh/hosts.yml" 2>/dev/null || true
-  [[ -n "$C_ssh_key" ]] && { GH_CONFIG_DIR="$(acct_dir "$name")/gh" "$gh" config set -h "$C_host" git_protocol ssh >/dev/null 2>&1 || true; }
-  fill_from_api "$name" || C_login="$(hosts_user "$name" "$C_host")"
+  local was="$C_login"; C_login=""
+  cli_login "$name" keep "$@" || { C_login="$was"; die "login did not finish"; }
+  if [[ -n "$C_ssh_key" ]]; then
+    case "$C_provider" in
+      github) GH_CONFIG_DIR="$(acct_dir "$name")/gh" "$(real_gh)" config set -h "$C_host" git_protocol ssh >/dev/null 2>&1 || true ;;
+      gitlab) GLAB_CONFIG_DIR="$(acct_dir "$name")/glab" "$(real_glab)" config set --host "$C_host" git_protocol ssh >/dev/null 2>&1 || true ;;
+    esac
+  fi
+  local n="$C_login"; C_login=""
+  fill_from_api "$name" || C_login="$n"
   save_conf "$name"
   info "'$name' is logged in as ${C_login:-?}."
 }
@@ -466,7 +689,9 @@ cmd_list() {
     [[ -n "$n" ]] || continue
     any=1; load_conf "$n"
     mark="  "; [[ "$n" == "$cur" ]] && mark="> "
-    who="${C_login:+$C_login@}$C_host"; logged_in "$n" || who="no-login"
+    who="${C_login:+$C_login@}$C_host"
+    [[ "$C_provider" == git ]] || logged_in "$n" || who="no-login ($C_host)"
+    [[ "$C_provider" == git ]] && who+=" (git)"
     b="$(binds_for "$n")" o="$(owners_for "$n")" tags=""
     if ((b)); then tags="$b bind"; ((b > 1)) && tags+=s; fi
     if ((o)); then tags+="${tags:+, }$o owner"; ((o > 1)) && tags+=s; fi
@@ -487,7 +712,7 @@ cmd_current() {
   printf '%s  (%s)  %s  %s <%s>\n' "$gn" "$gw" "${C_login:+$C_login@}$C_host" "${C_name:-?}" "${C_email:-?}"
   if resolve "$where" gh && [[ "$R_NAME" != "$gn" ]]; then
     load_conf "$R_NAME"
-    printf '  gh here: %s  (%s)  %s\n' "$R_NAME" "$R_WHY" "${C_login:+$C_login@}$C_host"
+    printf '  gh/glab here: %s  (%s)  %s\n' "$R_NAME" "$R_WHY" "${C_login:+$C_login@}$C_host"
   fi
 }
 
@@ -514,7 +739,7 @@ cmd_use() {
 cmd_run() {
   [[ $# -ge 1 ]] || die "usage: gham run <name> [command args…]   (no command: a shell)"
   local name="$1"; shift
-  need "$name"; link_shared "$(acct_dir "$name")"
+  need "$name"; load_conf "$name"; prepare_cli_dir "$name"
   R_WHY="gham run"; apply_env "$name"
   if (($#)); then exec "$@"; else exec "${SHELL:-bash}"; fi
 }
@@ -522,11 +747,12 @@ cmd_run() {
 cmd_env() {
   local name="${1:-}"
   if [[ -z "$name" ]]; then resolve || die "usage: gham env <name>"; name="$R_NAME"; fi
-  need "$name"; link_shared "$(acct_dir "$name")"
-  local start="${GIT_CONFIG_COUNT:-0}" v i
+  need "$name"; load_conf "$name"; prepare_cli_dir "$name"
+  local start="${GIT_CONFIG_COUNT:-0}" v i cli=""
   [[ "${GHAM_ENV_APPLIED:-}" == "$name" ]] || unset GHAM_ENV_APPLIED
   apply_env "$name"
-  for v in GH_CONFIG_DIR GHAM_ACCOUNT_ACTIVE GHAM_ENV_APPLIED GIT_CONFIG_COUNT; do
+  case "$C_provider" in github) cli=GH_CONFIG_DIR ;; gitlab) cli=GLAB_CONFIG_DIR ;; esac
+  for v in $cli GHAM_ACCOUNT_ACTIVE GHAM_ENV_APPLIED GIT_CONFIG_COUNT; do
     printf 'export %s=%q\n' "$v" "${!v}"
   done
   for ((i = start; i < ${GIT_CONFIG_COUNT:-0}; i++)); do
@@ -561,7 +787,7 @@ cmd_binds() {
   sort "$BINDS_FILE" | awk -F'\t' '{printf "%-50s %s\n", $1, $2}'
 }
 
-# Owner keys are "host/owner", lowercase; a bare owner means github.com.
+# Owner keys are "host/owner", lowercase; a bare owner takes host $2.
 owner_key() {
   local o host="${2:-github.com}"
   lower "$1"; o="${LC#https://}"; o="${o%/}"
@@ -583,6 +809,8 @@ cmd_owner() {
   done
   [[ -n "$owner" && -n "$name" ]] || die "usage: gham owner <owner> <name> [--hostname H]   (e.g. gham owner acme work)"
   need "$name"
+  # A bare owner lives on the account's own host (gitlab.com for a GitLab account).
+  [[ -n "$host" ]] || { load_conf "$name"; host="$C_host"; }
   local k; k="$(owner_key "$owner" "$host")"
   { [[ -f "$OWNERS_FILE" ]] && awk -F'\t' -v k="$k" '$1 != k' "$OWNERS_FILE"; printf '%s\t%s\n' "$k" "$name"; } > "$OWNERS_FILE.tmp"
   mv "$OWNERS_FILE.tmp" "$OWNERS_FILE"
@@ -593,6 +821,12 @@ cmd_unowner() {
   [[ $# -ge 1 ]] || die "usage: gham unowner <owner> [--hostname H]"
   local host=""; [[ "${2:-}" == --hostname ]] && host="${3:-}"
   local k; k="$(owner_key "$1" "$host")"
+  # A bare owner not on github.com: accept it when exactly one host has it.
+  if [[ -z "$host" && "$1" != */* && -f "$OWNERS_FILE" ]] && ! awk -F'\t' -v k="$k" '$1 == k {f = 1} END {exit !f}' "$OWNERS_FILE"; then
+    local m; m="$(awk -F'\t' -v o="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')" '{n = split($1, p, "/")} p[n] == o {print $1}' "$OWNERS_FILE")"
+    [[ -n "$m" && "$m" != *$'\n'* ]] && k="$m"
+    [[ "$m" == *$'\n'* ]] && die "unowner: '$1' is bound on several hosts — say which: $(echo "$m" | tr '\n' ' ')"
+  fi
   if ! [[ -f "$OWNERS_FILE" ]] || ! awk -F'\t' -v k="$k" '$1 == k {f = 1} END {exit !f}' "$OWNERS_FILE"; then die "unowner: $k is not bound"; fi
   awk -F'\t' -v k="$k" '$1 != k' "$OWNERS_FILE" > "$OWNERS_FILE.tmp" && mv "$OWNERS_FILE.tmp" "$OWNERS_FILE"
   info "Unbound owner $k"
@@ -604,7 +838,7 @@ cmd_owners() {
 }
 
 cmd_set() {
-  [[ $# -ge 1 ]] || die "usage: gham set <name> [<key> <value>]   keys: name email ssh-key host login"
+  [[ $# -ge 1 ]] || die "usage: gham set <name> [<key> <value>]   keys: provider name email ssh-key host login"
   need "$1"; local name="$1"; shift
   load_conf "$name"
   if [[ $# -eq 0 ]]; then
@@ -615,14 +849,19 @@ cmd_set() {
   local key="${1//-/_}" val="$2"
   case "$key" in
     name|email|host|login) ;;
+    provider) valid_provider "$val" ;;
     ssh_key)
       if [[ "$val" == none || -z "$val" ]]; then val=""
       else [[ -f "$val" ]] || die "set: no SSH key at $val"; val="$(cd "$(dirname "$val")" && pwd -P)/$(basename "$val")"; fi ;;
-    *) die "set: unknown key '$1' (name, email, ssh-key, host, login)" ;;
+    *) die "set: unknown key '$1' (provider, name, email, ssh-key, host, login)" ;;
   esac
   printf -v "C_$key" '%s' "$val"
   save_conf "$name"
   info "$name: ${1} = ${val:-(none)}"
+  if [[ "$key" == provider ]]; then
+    prepare_cli_dir "$name"
+    [[ "$val" == git ]] || logged_in "$name" || info "Log '$name' in to $C_host with: gham login $name"
+  fi
 }
 
 cmd_remove() {
@@ -635,9 +874,12 @@ cmd_remove() {
     [[ "$a" == [yY]* ]] || { info "aborted"; exit 1; }
   fi
   local dir; dir="$(acct_dir "$name")"
-  # Drops a keyring-stored token; the token itself stays valid on GitHub.
-  if logged_in "$name"; then
-    GH_CONFIG_DIR="$dir/gh" "$(real_gh)" auth logout -h "$C_host" ${C_login:+-u "$C_login"} >/dev/null 2>&1 || true
+  # Drops a keyring-stored token; the token itself stays valid on the host.
+  if gh_logged_in "$name" && find_bin gh "${GHAM_GH_BIN:-}"; then
+    GH_CONFIG_DIR="$dir/gh" "$RB" auth logout -h "$C_host" ${C_login:+-u "$C_login"} >/dev/null 2>&1 || true
+  fi
+  if glab_logged_in "$name" && find_bin glab "${GHAM_GLAB_BIN:-}"; then
+    GLAB_CONFIG_DIR="$dir/glab" "$RB" auth logout --hostname "$C_host" >/dev/null 2>&1 || true
   fi
   find "$dir" -mindepth 1 -maxdepth 2 -type l -delete
   rm -rf -- "$dir"
@@ -647,7 +889,7 @@ cmd_remove() {
   done
   [[ "$(default_account)" == "$name" ]] && rm -f "$DEFAULT_FILE" && info "'$name' was the default; set a new one with: gham default <name>"
   info "Removed '$name'."
-  if [[ "$C_ssh_key" == "$dir/"* ]]; then info "The SSH key gham uploaded stays on GitHub until you delete it at https://$C_host/settings/keys"; fi
+  if [[ "$C_ssh_key" == "$dir/"* ]]; then local u; u="$(keys_url)"; info "The SSH key gham made stays on $C_host until you delete it${u:+ at $u}"; fi
 }
 
 cmd_rename() {
@@ -665,30 +907,60 @@ cmd_rename() {
   info "Renamed '$1' → '$2'."
 }
 
-# Talks to GitHub: checks the gh token and the SSH key really are this account.
+# The user an SSH greeting names, into S_USER; fails when it is not a success.
+# GitHub "Hi X!", GitLab "Welcome to GitLab, @X!", Gitea/Forgejo "Hi there, X!",
+# Bitbucket "authenticated via ssh key" (no user), others "successfully authenticated".
+ssh_greeting() {
+  local out="$1"
+  S_USER=""
+  if [[ "$out" =~ Hi\ there,\ ([^!]+)! ]]; then S_USER="${BASH_REMATCH[1]}"
+  elif [[ "$out" =~ Welcome\ to\ GitLab,\ @([^!]+)! ]]; then S_USER="${BASH_REMATCH[1]}"
+  elif [[ "$out" =~ Hi\ ([^!]+)! ]]; then S_USER="${BASH_REMATCH[1]}"
+  elif [[ "$out" =~ (successfully\ authenticated|authenticated\ via\ ssh\ key) ]]; then :
+  else return 1
+  fi
+}
+
+# Talks to the host: checks the CLI token and the SSH key really are this account.
 cmd_verify() {
   local name="${1:-}"
   if [[ -z "$name" ]]; then resolve || die "usage: gham verify <name>"; name="$R_NAME"; fi
   need "$name"; load_conf "$name"
   local ok=0 who
-  if who="$(GH_CONFIG_DIR="$(acct_dir "$name")/gh" "$(real_gh)" api --hostname "$C_host" user --jq .login 2>/dev/null)"; then
-    echo "gh token   ok — $who"
-    if [[ -n "$C_login" && "$who" != "$C_login" ]]; then
-      echo "           but account.conf says '$C_login'"
-      if ! token_in_file "$name"; then
-        echo "           its token is in the shared system keyring, so another account's login replaced it."
-      fi
-      echo "           Fix: gham login $name   (sign in to GitHub as '$C_login' when the browser opens)"
-      ok=1
-    fi
-  else
-    echo "gh token   FAILED — run: gham login $name"; ok=1
-  fi
+  case "$C_provider" in
+    github)
+      if who="$(GH_CONFIG_DIR="$(acct_dir "$name")/gh" "$(real_gh)" api --hostname "$C_host" user --jq .login 2>/dev/null)"; then
+        echo "gh token   ok — $who"
+        if [[ -n "$C_login" && "$who" != "$C_login" ]]; then
+          echo "           but account.conf says '$C_login'"
+          if ! token_in_file "$name"; then
+            echo "           its token is in the shared system keyring, so another account's login replaced it."
+          fi
+          echo "           Fix: gham login $name   (sign in to GitHub as '$C_login' when the browser opens)"
+          ok=1
+        fi
+      else
+        echo "gh token   FAILED — run: gham login $name"; ok=1
+      fi ;;
+    gitlab)
+      local row
+      if row="$(GLAB_CONFIG_DIR="$(acct_dir "$name")/glab" "$(real_glab)" api --hostname "$C_host" user 2>/dev/null)" && who="$(json_str "$row" username)"; then
+        echo "glab token ok — $who"
+        if [[ -n "$C_login" && "$who" != "$C_login" ]]; then
+          echo "           but account.conf says '$C_login'. Fix: gham login $name   (sign in to GitLab as '$C_login')"
+          ok=1
+        fi
+      else
+        echo "glab token FAILED — run: gham login $name"; ok=1
+      fi ;;
+    *)
+      echo "https      your own git credential helper${C_login:+, username $C_login} (gham does not manage it)" ;;
+  esac
   if [[ -n "$C_ssh_key" ]]; then
     local out; out="$(ssh -i "$C_ssh_key" -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -o BatchMode=yes -T "git@$C_host" 2>&1 || true)"
-    if [[ "$out" =~ Hi\ ([^!]+)! ]]; then
-      echo "ssh key    ok — ${BASH_REMATCH[1]}"
-      [[ -z "$C_login" || "${BASH_REMATCH[1]}" == "$C_login" ]] || { echo "           but this key belongs to a different GitHub user"; ok=1; }
+    if ssh_greeting "$out"; then
+      echo "ssh key    ok${S_USER:+ — $S_USER}"
+      [[ -z "$C_login" || -z "$S_USER" || "$S_USER" == "$C_login" ]] || { echo "           but this key belongs to a different user on $C_host"; ok=1; }
     else
       echo "ssh key    FAILED — ${out##*$'\n'}"; ok=1
     fi
@@ -700,26 +972,33 @@ cmd_verify() {
 }
 
 cmd_doctor() {
-  local g h
+  local g h l
   echo "GHAM_HOME     $GHAM_HOME"
   echo "shared gh     $GH_SHARED"
+  echo "glab import   $GLAB_SHARED"
   g="$(real_bin git "${GHAM_GIT_BIN:-}" || echo none)"; h="$(real_bin gh "${GHAM_GH_BIN:-}" || echo none)"
+  l="$(real_bin glab "${GHAM_GLAB_BIN:-}" || echo none)"
   echo "real git      $g ($("$g" --version 2>/dev/null || echo '?'))"
-  echo "real gh       $h ($("$h" --version 2>/dev/null | head -1 || echo '?'))"
+  if [[ "$h" == none ]]; then echo "real gh       none (only github accounts need it)"
+  else echo "real gh       $h ($("$h" --version 2>/dev/null | head -1 || echo '?'))"; fi
+  if [[ "$l" == none ]]; then echo "real glab     none (only gitlab accounts need it)"
+  else echo "real glab     $l ($("$l" --version 2>/dev/null | head -1 || echo '?'))"; fi
   echo "git shim      $([[ "$(command -v git)" == "$GHAM_BIN/git" ]] && echo "on PATH" || echo "no — $(command -v git || echo none) wins; add: eval \"\$(gham init)\"")"
   echo "gh shim       $([[ "$(command -v gh)" == "$GHAM_BIN/gh" ]] && echo "on PATH" || echo "no — $(command -v gh || echo none) wins; add: eval \"\$(gham init)\"")"
+  echo "glab shim     $([[ "$(command -v glab)" == "$GHAM_BIN/glab" ]] && echo "on PATH" || echo "no — $(command -v glab || echo none) wins; rerun install.sh, then: eval \"\$(gham init)\"")"
   echo "shell init    $([[ -n "${GHAM_SHELL_INIT:-}" ]] && echo loaded || echo "not loaded")"
   if resolve "$PWD" git; then echo "git here      $R_NAME ($R_WHY)"; else echo "git here      nothing (passes straight through)"; fi
-  if resolve "$PWD" gh; then echo "gh here       $R_NAME ($R_WHY)"; else echo "gh here       nothing (passes straight through)"; fi
+  if resolve "$PWD" gh; then echo "gh/glab here  $R_NAME ($R_WHY)"; else echo "gh/glab here  nothing (passes straight through)"; fi
   if [[ "$g" != none ]]; then
     local v; v="$("$g" --version | awk '{print $3}')"
     [[ "$(printf '%s\n2.31.0\n' "$v" | sort -V | head -1)" == 2.31.0 ]] || echo "WARNING       git $v is older than 2.31, which ignores GIT_CONFIG_COUNT: identity switching will not work"
   fi
   [[ -n "${GH_TOKEN:-}${GITHUB_TOKEN:-}" ]] && echo "WARNING       GH_TOKEN / GITHUB_TOKEN is set: gh uses it for every account"
+  [[ -n "${GITLAB_TOKEN:-}${GLAB_TOKEN:-}" ]] && echo "WARNING       GITLAB_TOKEN / GLAB_TOKEN is set: glab uses it for every account"
   [[ -n "${GIT_SSH_COMMAND:-}" ]] && echo "WARNING       GIT_SSH_COMMAND is set: it overrides each account's SSH key"
   local a
   while IFS= read -r a; do
-    [[ -n "$a" ]] && logged_in "$a" && ! token_in_file "$a" && \
+    [[ -n "$a" ]] && gh_logged_in "$a" && ! token_in_file "$a" && \
       echo "WARNING       '$a' keeps its gh token in the shared keyring, where another account's login can replace it. Fix: gham login $a"
   done < <(account_names)
   echo
@@ -755,17 +1034,19 @@ _gham_complete() {
   local cur="\${COMP_WORDS[COMP_CWORD]}" cmd="\${COMP_WORDS[1]:-}" i="\$COMP_CWORD" w=""
   if ((i == 1)); then
     w="$GHAM_COMMANDS"
+  elif [[ "\${COMP_WORDS[i-1]}" == --provider ]]; then
+    w="$PROVIDERS"
   else
     case "\$cmd" in
       login|default|env|run|rename|mv|verify) ((i == 2)) && w="\$(command gham list --names 2>/dev/null)" ;;
       use) ((i == 2)) && w="\$(command gham list --names 2>/dev/null) --default" ;;
-      set) ((i == 2)) && w="\$(command gham list --names 2>/dev/null)"; ((i == 3)) && w="name email ssh-key host login" ;;
+      set) ((i == 2)) && w="\$(command gham list --names 2>/dev/null)"; ((i == 3)) && w="provider name email ssh-key host login" ;;
       remove|rm) w="\$(command gham list --names 2>/dev/null) -y --yes" ;;
       bind) if ((i == 2)); then COMPREPLY=(\$(compgen -d -- "\$cur")); return; fi; ((i == 3)) && w="\$(command gham list --names 2>/dev/null)" ;;
       unbind) ((i == 2)) && w="\$(cut -f1 "\$GHAM_HOME/binds" 2>/dev/null)" ;;
       owner) ((i == 3)) && w="\$(command gham list --names 2>/dev/null)"; ((i > 3)) && w="--hostname" ;;
       unowner) ((i == 2)) && w="\$(cut -f1 "\$GHAM_HOME/owners" 2>/dev/null | sed 's|^github.com/||')" ;;
-      add) w="--import --no-login --no-ssh --ssh-key --hostname --git-name --git-email" ;;
+      add) w="--provider --import --no-login --no-ssh --ssh-key --hostname --user --git-name --git-email" ;;
       list|ls) ((i == 2)) && w="--names" ;;
       init) ((i == 2)) && w="zsh bash" ;;
     esac
@@ -783,13 +1064,13 @@ _gham() {
   cmds=(
     'add:register an account' 'login:log an account in again' 'list:list accounts'
     'use:switch this shell to an account' 'default:show or set the default account'
-    'current:which account git and gh use here' 'run:run a command as an account'
+    'current:which account git, gh and glab use here' 'run:run a command as an account'
     'env:print the exports for scripts' 'bind:bind a directory to an account'
     'unbind:remove a directory bind' 'binds:list directory binds'
-    'owner:use an account for git in every repo of a GitHub owner'
+    'owner:use an account for git in every repo of an owner or group'
     'unowner:remove an owner bind' 'owners:list owner binds'
     'set:show or change an account'"'"'s settings' 'rename:rename an account'
-    'remove:delete an account' 'verify:check the token and SSH key against GitHub'
+    'remove:delete an account' 'verify:check the token and SSH key against the host'
     'doctor:check the setup' 'init:print shell integration'
     'version:print the gham version' 'help:show usage'
   )
@@ -798,13 +1079,14 @@ _gham() {
   case $words[2] in
     login|default|env|run|rename|mv|verify) (( CURRENT == 3 )) && compadd -a names ;;
     use) (( CURRENT == 3 )) && { compadd -a names; compadd -- --default; } ;;
-    set) (( CURRENT == 3 )) && compadd -a names; (( CURRENT == 4 )) && compadd -- name email ssh-key host login ;;
+    set) (( CURRENT == 3 )) && compadd -a names; (( CURRENT == 4 )) && compadd -- provider name email ssh-key host login ;;
     remove|rm) compadd -a names; compadd -- -y --yes ;;
     bind) (( CURRENT == 3 )) && _directories; (( CURRENT == 4 )) && compadd -a names ;;
     unbind) (( CURRENT == 3 )) && compadd -- ${(f)"$(cut -f1 "$GHAM_HOME/binds" 2>/dev/null)"} ;;
     owner) (( CURRENT == 4 )) && compadd -a names; (( CURRENT > 4 )) && compadd -- --hostname ;;
     unowner) (( CURRENT == 3 )) && compadd -- ${(f)"$(cut -f1 "$GHAM_HOME/owners" 2>/dev/null | sed 's|^github.com/||')"} ;;
-    add) compadd -- --import --no-login --no-ssh --ssh-key --hostname --git-name --git-email ;;
+    add) if [[ $words[CURRENT-1] == --provider ]]; then compadd -- github gitlab git
+         else compadd -- --provider --import --no-login --no-ssh --ssh-key --hostname --user --git-name --git-email; fi ;;
     list|ls) (( CURRENT == 3 )) && compadd -- --names ;;
     init) (( CURRENT == 3 )) && compadd -- zsh bash ;;
   esac
@@ -819,27 +1101,30 @@ EOF
 
 usage() {
   cat <<'EOF'
-gham — GitHub Account Manager
+gham — Git Hosting Account Manager (GitHub, GitLab, any git host)
 
-  gham add <name>              register an account: gh login, git identity, a new SSH key uploaded to GitHub
-      --import                   take the current gh login and git user instead of logging in
+  gham add <name>              register an account: log in, git identity, a new SSH key
+      --provider github|gitlab|git   github: gh login (default); gitlab: glab login;
+                                 git: any host, no CLI — identity and SSH key only
+      --hostname H               the host (GitHub Enterprise, self-managed GitLab, bitbucket.org…)
+      --import                   take the current gh/glab login and git user instead of logging in
       --ssh-key PATH | --no-ssh  use an existing key, or leave SSH to ~/.ssh
-      --git-name N --git-email E --hostname H --no-login   [-- extra gh auth login args]
-  gham login <name>            (re)log in an account's gh
-  gham list [--names]          list accounts  (> = what git and gh use here)
+      --git-name N --git-email E --user U --no-login   [-- extra gh/glab auth login args]
+  gham login <name>            (re)log in an account's gh or glab
+  gham list [--names]          list accounts  (> = what git uses here)
   gham use <name>              switch this shell to <name>  (gham use --default to clear)
-  gham bind <dir> <name>       use <name> for git and gh anywhere under <dir>
+  gham bind <dir> <name>       use <name> for git, gh and glab anywhere under <dir>
   gham unbind <dir>            remove a bind;  gham binds  lists them
-  gham owner <owner> <name>    use <name> for git in any repo whose remote is <owner>/* (e.g. gham owner acme work)
+  gham owner <owner> <name>    use <name> for git in any repo whose remote is <owner>/* on the account's host
   gham unowner <owner>         remove an owner bind;  gham owners  lists them
   gham default [name]          show or set the machine-wide default
-  gham current [dir]           which account git and gh use here, and why
+  gham current [dir]           which account git, gh and glab use here, and why
   gham run <name> [cmd…]       run a command (or a shell) as <name>, overriding binds
   gham env [name]              print the exports for scripts:  eval "$(gham env work)"
-  gham set <name> [key value]  show or change name, email, ssh-key, host, login
+  gham set <name> [key value]  show or change provider, name, email, ssh-key, host, login
   gham rename <old> <new>      rename an account (binds and the default follow)
   gham remove <name> [-y]      delete an account's local login and key
-  gham verify [name]           check the gh token and SSH key against GitHub
+  gham verify [name]           check the token and SSH key against the host
   gham doctor                  check the setup
   gham init [zsh|bash]         shell integration — add to your rc:  eval "$(gham init)"
   gham version                 print the gham version

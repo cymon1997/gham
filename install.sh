@@ -32,6 +32,7 @@ chmod 755 "$GHAM_HOME/bin/gham.new"
 mv "$GHAM_HOME/bin/gham.new" "$GHAM_HOME/bin/gham"
 ln -sfn gham "$GHAM_HOME/bin/git"
 ln -sfn gham "$GHAM_HOME/bin/gh"
+ln -sfn gham "$GHAM_HOME/bin/glab"
 
 echo "Installed $("$GHAM_HOME/bin/gham" version) to $GHAM_HOME/bin"
 
@@ -54,6 +55,8 @@ then open a new shell and register your first account:
 
   gham add personal --import        # reuse your current gh login and git identity
   gham add work                     # or log a new account in (gh login + new SSH key)
+  gham add lab --provider gitlab    # a GitLab account (glab login + new SSH key)
+  gham add bb --provider git --hostname bitbucket.org --git-email me@example.com
   gham bind ~/Codes/work work       # then use it automatically under a directory
 EOF
 fi
