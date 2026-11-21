@@ -4,6 +4,37 @@ All notable changes to gham are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [0.3.0] — 2026-11-21
+
+### Added
+- Providers: `gham add --provider github|gitlab|git`, stored as `provider=` in `account.conf`.
+  - `gitlab` logs in with `glab auth login` into the account's own `GLAB_CONFIG_DIR`, reads the
+    username, name and commit email from the API, uploads the generated key with
+    `glab ssh-key add`, and serves HTTPS tokens through `glab auth git-credential`.
+  - `git` works with any host and needs no CLI: git identity and SSH key only. gham prints the
+    public key, copies it to the clipboard when it can, and names the host's key page. HTTPS
+    keeps the user's own credential helper; `--user` sets `credential.<host>.username`.
+- A `glab` shim. `gh` and `glab` only take over for an account of their own provider and run
+  untouched otherwise.
+- `gham verify` per provider; the SSH check understands GitHub, GitLab, Gitea/Forgejo and
+  Bitbucket greetings. `gham doctor` shows glab and warns about `GITLAB_TOKEN` / `GLAB_TOKEN`.
+- `gham set <name> provider <p>`; `--user` on `add`; completion for providers.
+
+### Changed
+- gh is no longer required: only `github` accounts need it, only `gitlab` accounts need glab.
+  A missing CLI fails `add` before anything is created, and its shim exits 127.
+- `gham owner <owner> <name>` without `--hostname` binds the owner on the account's own host.
+  `gham unowner <owner>` finds a bare owner on its host when only one host has it.
+- `gham current` labels the second line `gh/glab here`.
+
+### Fixed
+- An account on a non-GitHub host lost HTTPS access: gham cleared the user's credential helper for
+  that host and put `gh auth git-credential` in its place, though gh held no token for it.
+
+### Compatibility
+- Accounts without a `provider` line are `github` and behave exactly as in 0.2. An older gham
+  ignores the new line.
+
 ## [0.2.1] — 2026-11-13
 
 ### Fixed
