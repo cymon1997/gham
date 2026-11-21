@@ -39,7 +39,7 @@ $ gh pr create             # opened by me-at-work
   aliases and tools that call them from `PATH` follow along.
 - **`~/.gitconfig` is never edited.** The account's settings are injected through git's own
   `GIT_CONFIG_COUNT` environment config, and `git config --global` still writes where it always did.
-- **A single bash script** with no dependencies beyond `bash`, `git` 2.31+ and `ssh-keygen`.
+- **A single bash script** with no dependencies beyond `bash` 4+, `git` 2.31+ and `ssh-keygen`.
   `gh` is needed only for GitHub accounts, `glab` only for GitLab accounts.
 
 ## Providers
@@ -131,6 +131,14 @@ Add this line to `~/.zshrc` or `~/.bashrc`, then open a new shell:
 ```bash
 eval "$(~/.gham/bin/gham init)"
 ```
+
+**macOS** ships bash 3.2, which gham does not run on yet: `brew install bash` first. The shims
+start with `#!/usr/bin/env bash`, so the Homebrew bash must come first on `PATH` for every program
+that runs `git`, including IDEs.
+
+**Order matters in your rc file.** Put the `gham init` line *after* anything else that changes
+`PATH`, such as `eval "$(brew shellenv)"`, so `~/.gham/bin` stays in front of Homebrew's `git`,
+`gh` and `glab`. `gham doctor` reports a shim that is not first.
 
 It puts `~/.gham/bin` first on `PATH`, defines a `gham` shell function so that `gham use` can
 change the current shell, and turns on tab completion. Check the setup with `gham doctor`.
@@ -312,9 +320,12 @@ git push && gh release create v1.0.0
   `--insecure-storage`, so the token is a plain-text file readable only by you, as with cam's stored
   login. `gham doctor` flags an account whose token is still in the keyring, and `gham login <name>`
   moves it.
-- **glab tokens live in each account's `glab/config.yml`,** which glab does by default. A login
-  made with `--use-keyring` is not copied by `--import`.
-- **`GH_TOKEN`, `GITHUB_TOKEN`, `GITLAB_TOKEN`, `GLAB_TOKEN` and `GIT_SSH_COMMAND` beat gham.**
+- **glab tokens live in each account's `glab/config.yml`, not the system keyring.** Current glab
+  stores tokens in the keyring by default, which has the same one-entry-per-host problem as gh, so
+  gham logs glab in with `--insecure-storage` (older glab without the flag used the file anyway).
+  `--import` copies only a file-stored login; `gham doctor` flags an account whose glab token is
+  in the keyring, and `gham login <name>` moves it.
+- **`GH_TOKEN`, `GITHUB_TOKEN`, `GITLAB_TOKEN`, `GITLAB_ACCESS_TOKEN`, `OAUTH_TOKEN` and `GIT_SSH_COMMAND` beat gham.**
   `gham doctor` warns about them.
 - **Removing an account doesn't revoke anything on the host.** Delete the uploaded key (on GitHub
   at `github.com/settings/keys`) and revoke the token (`github.com/settings/applications`, or

@@ -13,7 +13,7 @@ export GHAM_HOME="$HOME/.gham"
 export SHELL=/bin/bash
 export XDG_CONFIG_HOME="$HOME/.config"
 unset GHAM_ACCOUNT GHAM_ACCOUNT_ACTIVE GHAM_ENV_APPLIED GHAM_SHELL_INIT GH_CONFIG_DIR GH_TOKEN GITHUB_TOKEN \
-  GLAB_CONFIG_DIR GITLAB_TOKEN GLAB_TOKEN DISPLAY WAYLAND_DISPLAY \
+  GLAB_CONFIG_DIR GITLAB_TOKEN GITLAB_ACCESS_TOKEN OAUTH_TOKEN GITLAB_HOST DISPLAY WAYLAND_DISPLAY \
   GIT_SSH_COMMAND GIT_CONFIG_COUNT GIT_CONFIG_GLOBAL GIT_AUTHOR_EMAIL GIT_COMMITTER_EMAIL GIT_AUTHOR_NAME GIT_COMMITTER_NAME
 mkdir -p "$HOME/.config/gh" "$SANDBOX/fakebin" "$SANDBOX/work/repo" "$SANDBOX/oss"
 
@@ -49,6 +49,7 @@ chmod +x "$SANDBOX/fakebin/gh"
 cat > "$SANDBOX/fakebin/glab" <<'EOF'
 #!/usr/bin/env bash
 login="${FAKE_LOGIN:-tanuki}"
+[[ "${1:-} ${2:-} ${3:-}" == "auth login --help" ]] && { echo "  --insecure-storage   Store the token as plaintext"; exit 0; }
 case "${1:-} ${2:-}" in
   "auth login")
     printf 'git_protocol: https\nhosts:\n    gitlab.com:\n        token: glpat-x\n        api_host: gitlab.com\n        user: %s\n' "$login" > "$GLAB_CONFIG_DIR/config.yml"
@@ -56,7 +57,7 @@ case "${1:-} ${2:-}" in
   "auth logout") exit 0 ;;
   "auth git-credential")
     cat >/dev/null; printf 'protocol=https\nhost=gitlab.com\nusername=x\npassword=token-for-%s\n' "$GLAB_CONFIG_DIR"; exit 0 ;;
-  "ssh-key add") cp "$3" "$GLAB_CONFIG_DIR/uploaded.pub"; exit 0 ;;
+  "ssh-key add") cp "$3" "$GLAB_CONFIG_DIR/uploaded.pub"; echo "${GITLAB_HOST:-}" > "$GLAB_CONFIG_DIR/upload-host"; exit 0 ;;
   "config set") echo "$*" >> "$GLAB_CONFIG_DIR/config-set"; exit 0 ;;
 esac
 if [[ "${1:-}" == api ]]; then
@@ -241,7 +242,9 @@ check "gitlab: login comes from the API" grep -q '^login=tanuki' "$l/account.con
 check "gitlab: the commit email comes from the API" grep -q '^email=tanuki@commits.example' "$l/account.conf"
 check "gitlab: the name is the top-level one" grep -q '^name=Tanuki tanuki' "$l/account.conf"
 check "gitlab: add uploads the SSH key through glab" cmp -s "$l/ssh/id_ed25519.pub" "$l/glab/uploaded.pub"
-check "gitlab: switches glab to ssh" grep -q 'git_protocol ssh' "$l/glab/config-set"
+check "gitlab: switches glab to ssh in the account's own config" grep -q -- '--global --host gitlab.com git_protocol ssh' "$l/glab/config-set"
+check "gitlab: keeps the token out of the shared keyring" grep -q -- '--insecure-storage' "$l/glab/login-args"
+check "gitlab: the key goes to the account's host" grep -qx 'gitlab.com' "$l/glab/upload-host"
 check "gitlab: no gh directory" [ ! -e "$l/gh" ]
 mkdir -p "$SANDBOX/lab/repo"
 gham bind "$SANDBOX/lab" lab 2>/dev/null

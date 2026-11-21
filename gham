@@ -349,8 +349,15 @@ prepare_cli_dir() {
 # gh keeps the active account's token in one keyring entry per host, shared by
 # every GH_CONFIG_DIR, so the last login would win for all accounts. gham
 # therefore keeps each token in the account's own hosts.yml (mode 600).
-# glab already keeps its token in config.yml unless told --use-keyring.
+# glab does the same since it moved tokens to the keyring by default, so a
+# GitLab login also gets --insecure-storage, when this glab knows the flag
+# (older glab kept the token in config.yml anyway).
 GH_STORAGE=(--insecure-storage)
+glab_storage() {
+  GLAB_STORAGE=()
+  "$(real_glab)" auth login --help 2>&1 | grep -q -- '--insecure-storage' && GLAB_STORAGE=(--insecure-storage)
+  return 0
+}
 token_in_file() { [[ -f "$ACCOUNTS/$1/gh/hosts.yml" ]] && grep -qE '^[[:space:]]+oauth_token:' "$ACCOUNTS/$1/gh/hosts.yml"; }
 
 gh_logged_in()   { [[ -f "$ACCOUNTS/$1/gh/hosts.yml" ]] && grep -qE '^[[:space:]]+user:[[:space:]]*[^[:space:]]' "$ACCOUNTS/$1/gh/hosts.yml"; }
@@ -478,12 +485,13 @@ make_ssh_key() {
       fi
       GH_CONFIG_DIR="$ACCOUNTS/$name/gh" "$(real_gh)" config set -h "$C_host" git_protocol ssh >/dev/null 2>&1 || true ;;
     gitlab)
-      if GLAB_CONFIG_DIR="$ACCOUNTS/$name/glab" "$(real_glab)" ssh-key add "$dir/id_ed25519.pub" --title "$title" >/dev/null 2>&1; then
+      # ssh-key add has no --hostname; GITLAB_HOST picks the instance.
+      if GLAB_CONFIG_DIR="$ACCOUNTS/$name/glab" GITLAB_HOST="$C_host" "$(real_glab)" ssh-key add "$dir/id_ed25519.pub" --title "$title" >/dev/null 2>&1; then
         info "Uploaded SSH key '$title' to $C_host."
       else
         info "gham: could not upload the SSH key (the token needs the 'api' scope)."; manual_key_hint "$dir/id_ed25519.pub" "$name"
       fi
-      GLAB_CONFIG_DIR="$ACCOUNTS/$name/glab" "$(real_glab)" config set --host "$C_host" git_protocol ssh >/dev/null 2>&1 || true ;;
+      GLAB_CONFIG_DIR="$ACCOUNTS/$name/glab" "$(real_glab)" config set --global --host "$C_host" git_protocol ssh >/dev/null 2>&1 || true ;;
     *)
       manual_key_hint "$dir/id_ed25519.pub" "$name" ;;
   esac
@@ -641,7 +649,8 @@ cli_login() {
       [[ -n "$C_login" ]] || C_login="$(hosts_user "$name" "$C_host")" ;;
     gitlab)
       info "Starting GitLab login for '$name' on $C_host … (a token needs the 'api' scope for the key upload)"
-      GLAB_CONFIG_DIR="$dir/glab" "$(real_glab)" auth login --hostname "$C_host" "$@" || return 1
+      glab_storage
+      GLAB_CONFIG_DIR="$dir/glab" "$(real_glab)" auth login --hostname "$C_host" ${GLAB_STORAGE[@]+"${GLAB_STORAGE[@]}"} "$@" || return 1
       chmod 600 "$dir/glab/config.yml" 2>/dev/null || true
       [[ -n "$C_login" ]] || C_login="$(glab_user "$dir/glab/config.yml" "$C_host")" ;;
     *) die "'$name' is a plain git account: there is nothing to log in to. HTTPS uses your git credential helper." ;;
@@ -661,7 +670,7 @@ cmd_login() {
   if [[ -n "$C_ssh_key" ]]; then
     case "$C_provider" in
       github) GH_CONFIG_DIR="$(acct_dir "$name")/gh" "$(real_gh)" config set -h "$C_host" git_protocol ssh >/dev/null 2>&1 || true ;;
-      gitlab) GLAB_CONFIG_DIR="$(acct_dir "$name")/glab" "$(real_glab)" config set --host "$C_host" git_protocol ssh >/dev/null 2>&1 || true ;;
+      gitlab) GLAB_CONFIG_DIR="$(acct_dir "$name")/glab" "$(real_glab)" config set --global --host "$C_host" git_protocol ssh >/dev/null 2>&1 || true ;;
     esac
   fi
   local n="$C_login"; C_login=""
@@ -994,12 +1003,15 @@ cmd_doctor() {
     [[ "$(printf '%s\n2.31.0\n' "$v" | sort -V | head -1)" == 2.31.0 ]] || echo "WARNING       git $v is older than 2.31, which ignores GIT_CONFIG_COUNT: identity switching will not work"
   fi
   [[ -n "${GH_TOKEN:-}${GITHUB_TOKEN:-}" ]] && echo "WARNING       GH_TOKEN / GITHUB_TOKEN is set: gh uses it for every account"
-  [[ -n "${GITLAB_TOKEN:-}${GLAB_TOKEN:-}" ]] && echo "WARNING       GITLAB_TOKEN / GLAB_TOKEN is set: glab uses it for every account"
+  [[ -n "${GITLAB_TOKEN:-}${GITLAB_ACCESS_TOKEN:-}${OAUTH_TOKEN:-}" ]] && echo "WARNING       GITLAB_TOKEN / GITLAB_ACCESS_TOKEN / OAUTH_TOKEN is set: glab uses it for every account"
   [[ -n "${GIT_SSH_COMMAND:-}" ]] && echo "WARNING       GIT_SSH_COMMAND is set: it overrides each account's SSH key"
   local a
   while IFS= read -r a; do
     [[ -n "$a" ]] && gh_logged_in "$a" && ! token_in_file "$a" && \
       echo "WARNING       '$a' keeps its gh token in the shared keyring, where another account's login can replace it. Fix: gham login $a"
+    [[ -n "$a" && -f "$ACCOUNTS/$a/glab/config.yml" ]] && ! glab_logged_in "$a" && \
+      grep -qE '^[[:space:]]+use_keyring:[[:space:]]*true' "$ACCOUNTS/$a/glab/config.yml" && \
+      echo "WARNING       '$a' keeps its glab token in the system keyring, where another account's login can replace it. Fix: gham login $a"
   done < <(account_names)
   echo
   cmd_list

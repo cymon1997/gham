@@ -8,7 +8,9 @@ All notable changes to gham are recorded here. The format follows
 
 ### Added
 - Providers: `gham add --provider github|gitlab|git`, stored as `provider=` in `account.conf`.
-  - `gitlab` logs in with `glab auth login` into the account's own `GLAB_CONFIG_DIR`, reads the
+  - `gitlab` logs in with `glab auth login --insecure-storage` (when the glab supports the flag)
+    into the account's own `GLAB_CONFIG_DIR`, so tokens stay per account instead of in glab's
+    shared keyring entry. It reads the
     username, name and commit email from the API, uploads the generated key with
     `glab ssh-key add`, and serves HTTPS tokens through `glab auth git-credential`.
   - `git` works with any host and needs no CLI: git identity and SSH key only. gham prints the
@@ -17,7 +19,8 @@ All notable changes to gham are recorded here. The format follows
 - A `glab` shim. `gh` and `glab` only take over for an account of their own provider and run
   untouched otherwise.
 - `gham verify` per provider; the SSH check understands GitHub, GitLab, Gitea/Forgejo and
-  Bitbucket greetings. `gham doctor` shows glab and warns about `GITLAB_TOKEN` / `GLAB_TOKEN`.
+  Bitbucket greetings. `gham doctor` shows glab, warns about `GITLAB_TOKEN`,
+  `GITLAB_ACCESS_TOKEN` and `OAUTH_TOKEN`, and about glab tokens left in the keyring.
 - `gham set <name> provider <p>`; `--user` on `add`; completion for providers.
 
 ### Changed
@@ -30,6 +33,10 @@ All notable changes to gham are recorded here. The format follows
 ### Fixed
 - An account on a non-GitHub host lost HTTPS access: gham cleared the user's credential helper for
   that host and put `gh auth git-credential` in its place, though gh held no token for it.
+
+### Docs
+- README: bash 4+ is required (macOS: `brew install bash`), and `gham init` belongs after
+  `brew shellenv` in the rc file.
 
 ### Compatibility
 - Accounts without a `provider` line are `github` and behave exactly as in 0.2. An older gham
